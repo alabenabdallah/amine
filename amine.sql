@@ -813,6 +813,10 @@ language sql immutable set search_path = '' as $$
     when 'couriers' then '{"share_bps":8000,"max_active_jobs":2}'::jsonb
     when 'auth' then '{"require_phone_verification":false,"admin_mfa_required":false}'::jsonb
     when 'push' then '{"enabled":false,"function_url":""}'::jsonb
+    -- Fidélité (version 8) : points gagnés par dinar de marchandises livrées, valeur d'un point (millimes),
+    -- seuil et plafond d'utilisation, parrainage (points offerts à chacun, première commande minimale,
+    -- nombre de filleuls au plus), relance des restaurants inactifs (jours sans commande).
+    when 'loyalty' then '{"enabled":true,"earn_per_dt":1,"point_value":10,"min_redeem":500,"max_redeem_bps":2000,"referral_enabled":true,"referral_points":1000,"referral_min_subtotal":100000,"referral_max":20,"remind_enabled":true,"remind_days":15}'::jsonb
     -- Facturation : préfixes de numérotation, droit de timbre par facture (millimes), TVA de la
     -- livraison, délai entre deux relances, mention libre en bas de facture. Prix affichés TTC.
     when 'invoicing' then '{"prefix":"FA","credit_prefix":"AV","stamp":1000,"delivery_vat_rate":19,"reminder_days":7,"vat_verified":false,"footer":""}'::jsonb
@@ -825,6 +829,14 @@ create or replace function amine.setting(p_key text) returns jsonb
 language sql stable set search_path = '' as $$
   select amine.default_setting(p_key) || coalesce((select s.value from amine.settings s where s.key = p_key), '{}'::jsonb)
 $$;
+
+-- Solde de points de fidélité d'un client (table amine.loyalty_ledger, créée par 14_loyalty.sql : la fonction
+-- est en plpgsql pour que les fichiers précédents puissent l'utiliser avant la création de la table).
+create or replace function amine.loyalty_balance(p_customer uuid) returns int
+language plpgsql stable set search_path = '' as $$
+begin
+  return coalesce((select sum(l.delta) from amine.loyalty_ledger l where l.customer_id = p_customer), 0)::int;
+end $$;
 
 -- Identité de l'appelant ---------------------------------------------------------------------
 create or replace function amine.uid() returns uuid
@@ -1491,6 +1503,7 @@ begin
     'delivered_at', o.delivered_at, 'cancelled_at', o.cancelled_at, 'updated_at', o.updated_at,
     'subtotal', o.subtotal, 'delivery_fee', o.delivery_fee, 'service_fee', o.service_fee, 'total', o.total,
     'discount', o.discount, 'promo_code', o.promo_code, 'source', o.source,
+
     'delivery_slot', coalesce(o.delivery_slot, 'asap'), 'deliver_on', o.deliver_on,
     'slot_start', amine.slot_start(o.deliver_on, o.delivery_slot), 'slot_end', amine.slot_end(o.deliver_on, o.delivery_slot),
     'payment_method', o.payment_method, 'payer', o.payer, 'cod_collected', o.cod_collected,
@@ -1517,6 +1530,7 @@ begin
       select jsonb_agg(jsonb_build_object('product_id', i.product_id, 'name', i.name, 'unit', i.unit,
         'unit_price', i.unit_price, 'quantity', i.quantity, 'total', i.total,
         'actual_qty', i.actual_qty, 'list_price', i.list_price, 'vat_rate', i.vat_rate,
+        'flash', i.flash_sale_id is not null,
         'image_url', pr.image_url, 'ref', pr.ref,
         'lots', case when p_view in ('merchant', 'admin') and i.product_id is not null then amine.order_item_lots(o.code, i.product_id) end)
         order by i.name)
@@ -1527,6 +1541,11 @@ begin
         'note', case when p_view = 'admin' then e.note end) order by e.id)
       from amine.order_events e where e.order_id = o.id), '[]'::jsonb)
   );
+
+  -- Fidélité : points utilisés sur la commande et points gagnés à la livraison.
+  j := j || jsonb_build_object('loyalty_points', o.loyalty_points, 'loyalty_discount', o.loyalty_discount,
+    'points_earned', case when p_view in ('customer', 'admin') and o.status = 'delivered' then
+      (select coalesce(sum(l.delta), 0)::int from amine.loyalty_ledger l where l.order_id = o.id and l.kind = 'earn') end);
 
   -- Point de retrait (commerce ou expéditeur du colis)
   j := j || jsonb_build_object('pickup', jsonb_build_object(
@@ -1631,6 +1650,12 @@ begin
   -- Commandes récurrentes du lendemain et relances des factures échues (08_business.sql).
   perform amine.run_recurring_orders();
   perform amine.remind_overdue_invoices();
+  -- Relance des restaurants inactifs (14_loyalty.sql) : un incident ici ne bloque jamais les autres tâches.
+  begin
+    perform amine.remind_inactive_clients();
+  exception when others then
+    null;
+  end;
 end $$;
 
 -- =============================================================================================
@@ -1646,14 +1671,14 @@ drop function if exists public.get_store_reviews(text, int);
 
 create or replace function public.amine_health() returns jsonb
 language sql security definer set search_path = '' as $$
-  select jsonb_build_object('ok', true, 'app', 'amine', 'schema_version', 4, 'time', now())
+  select jsonb_build_object('ok', true, 'app', 'amine', 'schema_version', 5, 'time', now())
 $$;
 
 create or replace function public.get_public_config() returns jsonb
 language plpgsql security definer set search_path = '' as $$
 begin
   return jsonb_build_object(
-    'schema_version', 4,
+    'schema_version', 5,
     'platform', amine.setting('platform'),
     -- Clé publique VAPID des notifications push, seulement si l'envoi est activé.
     'push', (select jsonb_build_object('public_key', k.public_key) from amine.push_keys k
@@ -1839,6 +1864,7 @@ begin
     'products', coalesce((
       select jsonb_agg(amine.product_json(p) || case when not v_terms then '{}'::jsonb
           else jsonb_build_object('client_price', nullif(amine.unit_price(p, v_uid, 1), p.price)) end
+          || amine.flash_card(p, v_uid)
         order by p.sort, p.name)
       from amine.products p where p.store_id = s.id and p.deleted_at is null and p.is_available), '[]'::jsonb));
 end $$;
@@ -1854,6 +1880,7 @@ declare
   v_issues jsonb := '[]'::jsonb;
   v_sub bigint := 0;
   v_unit int;
+  v_flash jsonb;
   rec record;
   pr amine.products;
 begin
@@ -1903,9 +1930,16 @@ begin
     else
       select * into pr from amine.products where id = rec.pid;
       v_unit := amine.unit_price(pr, p_customer, rec.qty::int);
+      -- Vente flash en cours : son prix s'applique s'il est plus bas et si la quantité reste dans les limites.
+      v_flash := amine.flash_for(rec.pid, v_unit, rec.qty::int);
+      if coalesce((v_flash ->> 'applies')::boolean, false) then
+        v_unit := (v_flash ->> 'price')::int;
+      end if;
       v_lines := v_lines || jsonb_build_object('product_id', rec.pid, 'name', rec.name, 'unit', rec.unit,
         'unit_price', v_unit, 'list_price', rec.price, 'vat_rate', pr.vat_rate, 'quantity', rec.qty,
-        'total', v_unit::bigint * rec.qty);
+        'total', v_unit::bigint * rec.qty,
+        'flash', v_flash,
+        'flash_sale_id', case when coalesce((v_flash ->> 'applies')::boolean, false) then v_flash ->> 'id' end);
       v_sub := v_sub + v_unit::bigint * rec.qty;
     end if;
   end loop;
@@ -1951,7 +1985,8 @@ declare
   v_discount int;
 begin
   if v_code = '' then
-    return null;
+    -- Aucun code saisi : offre de bienvenue automatique éventuelle (14_loyalty.sql).
+    return amine.auto_promo(p_customer, p_store, p_subtotal, p_fee, p_service, p_lock);
   end if;
   if v_code !~ '^[A-Z0-9]{3,20}$' then
     return jsonb_build_object('code', left(v_code, 20), 'ok', false, 'error', 'PROMO_INVALID');
@@ -2001,8 +2036,10 @@ end $$;
 
 -- Devis d'une commande. Sans adresse (visiteur), les frais affichés sont ceux de base de la zone.
 drop function if exists public.quote_order(uuid, jsonb, uuid);
+drop function if exists public.quote_order(uuid, jsonb, uuid, text);
 create or replace function public.quote_order(
-  p_store_id uuid, p_items jsonb, p_address_id uuid default null, p_promo_code text default null
+  p_store_id uuid, p_items jsonb, p_address_id uuid default null, p_promo_code text default null,
+  p_use_points boolean default false
 ) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
@@ -2019,6 +2056,8 @@ declare
   v_reason text;
   v_promo jsonb;
   v_discount int := 0;
+  v_loyalty jsonb;
+  v_loy_discount int := 0;
   v_stamp int := amine.stamp_fee();
   v_uid uuid := auth.uid();
   cu amine.profiles;
@@ -2059,12 +2098,21 @@ begin
   if coalesce((v_promo ->> 'ok')::boolean, false) then
     v_discount := (v_promo ->> 'discount')::int;
   end if;
+  -- Points de fidélité : utilisables par un client connecté, sur ce qui reste à payer après le code promo.
+  if v_uid is not null then
+    v_loyalty := amine.loyalty_redeem_calc(v_uid, v_sub, v_sub + v_fee + v_service + v_stamp - v_discount);
+    if coalesce(p_use_points, false) and (v_loyalty ->> 'points')::int > 0 then
+      v_loy_discount := (v_loyalty ->> 'discount')::int;
+    end if;
+    v_loyalty := v_loyalty || jsonb_build_object('applied', v_loy_discount > 0);
+  end if;
 
   return jsonb_build_object(
     'lines', v_cart -> 'lines', 'issues', v_cart -> 'issues',
     'subtotal', v_sub, 'delivery_fee', v_fee, 'fee_is_estimate', p_address_id is null,
-    'service_fee', v_service, 'discount', v_discount, 'promo', v_promo, 'stamp_fee', v_stamp,
-    'total', v_sub + v_fee + v_service + v_stamp - v_discount,
+    'service_fee', v_service, 'discount', v_discount + v_loy_discount, 'promo_discount', v_discount,
+    'loyalty', v_loyalty, 'loyalty_discount', v_loy_discount, 'promo', v_promo, 'stamp_fee', v_stamp,
+    'total', v_sub + v_fee + v_service + v_stamp - v_discount - v_loy_discount,
     -- Paiement sur compte : seulement pour les clients qui en bénéficient, dans la limite de l'encours.
     'account', case when cu.id is null or cu.payment_terms <> 'account' then null else jsonb_build_object(
       'payment_days', cu.payment_days, 'credit_limit', cu.credit_limit, 'used', v_exposure,
@@ -2137,7 +2185,10 @@ begin
     'courier', case when c.user_id is null or c.status = 'archived' then null else jsonb_build_object(
       'status', c.status, 'status_note', c.status_note, 'is_online', c.is_online, 'vehicle', c.vehicle, 'zone_id', c.zone_id) end,
     'unread', (select count(*) from amine.notifications n where n.user_id = p.id and n.read_at is null),
-    'mfa', amine.has_mfa(p.id));
+    'mfa', amine.has_mfa(p.id),
+    -- Fidélité (14_loyalty.sql) : solde de points et programme actif ou non.
+    'points', amine.loyalty_balance(p.id),
+    'loyalty', coalesce((amine.setting('loyalty') ->> 'enabled')::boolean, false));
 end $$;
 
 create or replace function public.update_my_profile(
@@ -2353,9 +2404,11 @@ end $$;
 -- commande récurrente). Toutes les vérifications sont ici : dépôt actif, créneau, adresse livrable,
 -- prix (prix négociés du client compris), stock et paiement.
 drop function if exists amine.create_store_order(amine.profiles, uuid, uuid, jsonb, text, text, text, text, text, text, uuid);
+drop function if exists amine.create_store_order(amine.profiles, uuid, uuid, jsonb, text, text, text, text, text, text, uuid, text, uuid);
 create or replace function amine.create_store_order(
   p amine.profiles, p_store_id uuid, p_address_id uuid, p_items jsonb, p_note text, p_key text, p_promo_code text,
-  p_slot text, p_source text, p_actor text, p_actor_id uuid, p_payment text default 'cod', p_recurring uuid default null
+  p_slot text, p_source text, p_actor text, p_actor_id uuid, p_payment text default 'cod', p_recurring uuid default null,
+  p_use_points boolean default false
 ) returns amine.orders
 language plpgsql set search_path = '' as $$
 declare
@@ -2372,6 +2425,9 @@ declare
   v_note text := amine.txt(p_note, 'note', 300, false, 1, true);
   v_promo jsonb;
   v_discount int := 0;
+  v_loyalty jsonb;
+  v_loy_points int := 0;
+  v_loy_discount int := 0;
   v_stamp int := amine.stamp_fee();
   v_total int;
   v_code text;
@@ -2412,14 +2468,29 @@ begin
   -- Code promo (la ligne est verrouillée : deux commandes simultanées ne dépassent pas les limites).
   v_promo := amine.promo_eval(p_promo_code, p.id, s, v_sub, v_fee, v_service, true);
   if v_promo is not null then
-    if not (v_promo ->> 'ok')::boolean then
+    if (v_promo ->> 'ok')::boolean then
+      v_discount := (v_promo ->> 'discount')::int;
+    elsif coalesce((v_promo ->> 'auto')::boolean, false) then
+      -- Offre automatique qui ne s'applique pas à ce panier : pas de remise, pas d'erreur.
+      v_promo := null;
+    else
       perform amine.err(v_promo ->> 'error', v_promo ->> 'min_subtotal');
     end if;
-    v_discount := (v_promo ->> 'discount')::int;
   end if;
-  v_total := v_sub + v_fee + v_service + v_stamp - v_discount;
+  -- Points de fidélité : utilisés seulement à la demande du client, dans les limites du programme.
+  if coalesce(p_use_points, false) then
+    v_loyalty := amine.loyalty_redeem_calc(p.id, v_sub, v_sub + v_fee + v_service + v_stamp - v_discount);
+    v_loy_points := (v_loyalty ->> 'points')::int;
+    v_loy_discount := (v_loyalty ->> 'discount')::int;
+    if v_loy_points < 1 then
+      perform amine.err('POINTS_NOT_USABLE');
+    end if;
+  end if;
+  v_total := v_sub + v_fee + v_service + v_stamp - v_discount - v_loy_discount;
   perform amine.check_payment(p, coalesce(p_payment, 'cod'), v_total);
   v_code := amine.new_order_code();
+  -- Prix flash : les quantités vendues sont recomptées sous verrou (deux commandes simultanées ne dépassent pas le stock offert).
+  perform amine.flash_claim(v_cart -> 'lines');
   perform amine.stock_context('sale', v_code);
   perform amine.reserve_stock(v_cart -> 'lines');
 
@@ -2428,21 +2499,26 @@ begin
     pickup_name, pickup_phone, pickup_address, pickup_lat, pickup_lng,
     dropoff_name, dropoff_phone, dropoff_address, dropoff_details, dropoff_lat, dropoff_lng, dropoff_located_by,
     payer, distance_km, subtotal, delivery_fee, service_fee, discount, promo_code, stamp_fee, total, commission,
-    courier_earning, customer_note, idempotency_key, source, delivery_slot, deliver_on, payment_method, recurring_id)
+    courier_earning, customer_note, idempotency_key, source, delivery_slot, deliver_on, payment_method, recurring_id,
+    loyalty_points, loyalty_discount)
   values (
     v_code, 'store', p.id, s.id, s.zone_id, 'placed',
     s.name, s.phone, s.address, s.lat, s.lng,
     p.business_name, p.phone, a.line, a.details, a.lat, a.lng, a.located_by,
-    'customer', v_km, v_sub, v_fee, v_service, v_discount, v_promo ->> 'code', v_stamp, v_total,
+    'customer', v_km, v_sub, v_fee, v_service, v_discount + v_loy_discount, v_promo ->> 'code', v_stamp, v_total,
     round(v_sub::numeric * s.commission_bps / 10000)::int, round(v_fee::numeric * v_share / 10000)::int,
-    v_note, p_key, p_source, coalesce(p_slot, 'asap'), v_day, coalesce(p_payment, 'cod'), p_recurring)
+    v_note, p_key, p_source, coalesce(p_slot, 'asap'), v_day, coalesce(p_payment, 'cod'), p_recurring,
+    v_loy_points, v_loy_discount)
   returning * into o;
 
-  insert into amine.order_items (order_id, product_id, name, unit, unit_price, list_price, vat_rate, quantity, total)
+  insert into amine.order_items (order_id, product_id, name, unit, unit_price, list_price, vat_rate, quantity, total, flash_sale_id)
   select o.id, (e.value ->> 'product_id')::uuid, e.value ->> 'name', e.value ->> 'unit',
     (e.value ->> 'unit_price')::int, (e.value ->> 'list_price')::int, (e.value ->> 'vat_rate')::smallint,
-    (e.value ->> 'quantity')::int, (e.value ->> 'total')::int
+    (e.value ->> 'quantity')::int, (e.value ->> 'total')::int, (e.value ->> 'flash_sale_id')::uuid
   from jsonb_array_elements(v_cart -> 'lines') e;
+  if v_loy_points > 0 then
+    perform amine.loyalty_add(p.id, -v_loy_points, 'redeem', o.id, o.code);
+  end if;
 
   perform amine.log_order(o.id, 'placed', 'status', p_actor, p_actor_id, case when p_source <> 'app' then p_source end);
   perform amine.notify_store(s.id, 'order_new', jsonb_build_object('code', o.code, 'total', o.total),
@@ -2453,10 +2529,11 @@ end $$;
 drop function if exists public.place_order(uuid, jsonb, uuid, text, text);
 drop function if exists public.place_order(uuid, jsonb, uuid, text, text, text);
 drop function if exists public.place_order(uuid, jsonb, uuid, text, text, text, text, text);
+drop function if exists public.place_order(uuid, jsonb, uuid, text, text, text, text, text, text);
 create or replace function public.place_order(
   p_store_id uuid, p_items jsonb, p_address_id uuid, p_note text default null, p_idempotency_key text default null,
   p_promo_code text default null, p_delivery_slot text default 'asap', p_source text default 'app',
-  p_payment_method text default 'cod'
+  p_payment_method text default 'cod', p_use_points boolean default false
 ) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
@@ -2477,7 +2554,8 @@ begin
   perform amine.hit('order:' || p.id, 10, 600);
   perform amine.assert_can_order(p);
   o := amine.create_store_order(p, p_store_id, p_address_id, p_items, p_note, v_key, p_promo_code,
-    coalesce(p_delivery_slot, 'asap'), coalesce(p_source, 'app'), 'customer', p.id, coalesce(p_payment_method, 'cod'));
+    coalesce(p_delivery_slot, 'asap'), coalesce(p_source, 'app'), 'customer', p.id, coalesce(p_payment_method, 'cod'),
+    null, coalesce(p_use_points, false));
   return jsonb_build_object('code', o.code, 'replayed', false, 'total', o.total,
     'delivery_slot', o.delivery_slot, 'deliver_on', o.deliver_on, 'payment_method', o.payment_method);
 exception
@@ -3023,12 +3101,15 @@ begin
   delete from amine.addresses where user_id = p.id;
   delete from amine.notifications where user_id = p.id;
   delete from amine.favorites where user_id = p.id;
+  -- Points et parrainages n'ont pas de valeur comptable : ils sont effacés avec le compte.
+  delete from amine.loyalty_ledger where customer_id = p.id;
+  delete from amine.referrals where referrer_id = p.id or referee_id = p.id;
   delete from amine.store_staff where user_id = p.id;
   update amine.complaints set message = '[supprimé]', reply = null where customer_id = p.id;
   delete from amine.courier_locations where courier_id = p.id;
   update amine.couriers set cin = null, note = null, is_online = false where user_id = p.id;
   update amine.profiles set email = null, full_name = '', phone = null, phone_verified = false,
-    business_name = null, tax_id = null, admin_note = null,
+    business_name = null, tax_id = null, admin_note = null, referral_code = null,
     marketing_opt_in = false, status = 'blocked', is_admin = false, updated_at = now()
   where id = p.id;
   perform amine.audit('account.deleted', 'profile', p.id::text, '{}'::jsonb);
@@ -4453,6 +4534,7 @@ language sql stable set search_path = '' as $$
     'created_at', p.created_at,
     'payment_terms', p.payment_terms, 'payment_days', p.payment_days, 'credit_limit', p.credit_limit,
     'discount_bps', p.discount_bps, 'balance', amine.account_balance(p.id),
+    'points', amine.loyalty_balance(p.id), 'marketing_opt_in', p.marketing_opt_in,
     'courier', (select c.status from amine.couriers c where c.user_id = p.id),
     'staff', (select count(*) from amine.store_staff st where st.user_id = p.id),
     'orders', (select count(*) from amine.orders o where o.customer_id = p.id and o.kind = 'store'),
@@ -4877,10 +4959,10 @@ declare
   a amine.profiles := amine.require_admin();
   o amine.orders;
   s amine.stores;
-  pr amine.promotions;
   v_cart jsonb;
   v_sub int;
   v_discount int;
+  v_reprice jsonb;
   v_items boolean := false;
 begin
   if p_data is null or jsonb_typeof(p_data) <> 'object' then
@@ -4910,31 +4992,34 @@ begin
     perform amine.stock_context('return', o.code, 'edited');
     update amine.products p set stock = p.stock + i.quantity, updated_at = now()
     from amine.order_items i where i.order_id = o.id and i.product_id = p.id and p.stock is not null;
+    -- Les anciennes lignes sont retirées avant le nouveau chiffrage : leurs unités flash redeviennent disponibles.
+    delete from amine.order_items where order_id = o.id;
     v_cart := amine.price_cart(o.store_id, p_data -> 'items', true, o.customer_id);
     perform amine.stock_context('sale', o.code, 'edited');
     perform amine.reserve_stock(v_cart -> 'lines');
-    delete from amine.order_items where order_id = o.id;
-    insert into amine.order_items (order_id, product_id, name, unit, unit_price, list_price, vat_rate, quantity, total)
+    perform amine.flash_claim(v_cart -> 'lines');
+    insert into amine.order_items (order_id, product_id, name, unit, unit_price, list_price, vat_rate, quantity, total, flash_sale_id)
     select o.id, (e.value ->> 'product_id')::uuid, e.value ->> 'name', e.value ->> 'unit',
       (e.value ->> 'unit_price')::int, (e.value ->> 'list_price')::int, (e.value ->> 'vat_rate')::smallint,
-      (e.value ->> 'quantity')::int, (e.value ->> 'total')::int
+      (e.value ->> 'quantity')::int, (e.value ->> 'total')::int, (e.value ->> 'flash_sale_id')::uuid
     from jsonb_array_elements(v_cart -> 'lines') e;
     v_sub := (v_cart ->> 'subtotal')::int;
-    if o.promo_code is not null then
-      select * into pr from amine.promotions where code = o.promo_code;
-    end if;
-    if pr.id is not null then
-      v_discount := amine.promo_discount(pr, v_sub, o.delivery_fee, o.service_fee);
-    else
-      v_discount := least(o.discount, v_sub + o.delivery_fee + o.service_fee);
+    -- Remise (code promo recalculé, points conservés dans la limite de ce qui reste à payer).
+    v_reprice := amine.reprice_discount(o, v_sub);
+    v_discount := (v_reprice ->> 'discount')::int;
+    if (v_reprice ->> 'refund_points')::int > 0 then
+      perform amine.loyalty_add(o.customer_id, (v_reprice ->> 'refund_points')::int, 'edit_refund', o.id, o.code);
     end if;
     o.subtotal := v_sub;
     o.discount := v_discount;
+    o.loyalty_discount := (v_reprice ->> 'loyalty_discount')::int;
+    o.loyalty_points := (v_reprice ->> 'loyalty_points')::int;
     o.total := v_sub + o.delivery_fee + o.service_fee + o.stamp_fee - v_discount;
     o.commission := round(v_sub::numeric * s.commission_bps / 10000)::int;
   end if;
   update amine.orders set customer_note = o.customer_note, delivery_slot = o.delivery_slot, deliver_on = o.deliver_on,
-    subtotal = o.subtotal, discount = o.discount, total = o.total, commission = o.commission, updated_at = now()
+    subtotal = o.subtotal, discount = o.discount, loyalty_discount = o.loyalty_discount, loyalty_points = o.loyalty_points,
+    total = o.total, commission = o.commission, updated_at = now()
   where id = o.id returning * into o;
   perform amine.log_order(o.id, o.status, 'updated', 'admin', a.id, case when v_items then 'items' end);
   perform amine.notify(o.customer_id, 'order_updated', jsonb_build_object('code', o.code, 'total', o.total), '#/orders/' || o.code);
@@ -5238,7 +5323,7 @@ begin
   if v_store is not null and not exists (select 1 from amine.stores where id = v_store) then
     perform amine.err('INVALID_INPUT', 'store_id');
   end if;
-  foreach b in array array['first_order_only', 'is_public', 'is_active'] loop
+  foreach b in array array['first_order_only', 'is_public', 'is_active', 'auto_apply'] loop
     if p_data ? b and jsonb_typeof(p_data -> b) <> 'boolean' then
       perform amine.err('INVALID_INPUT', b);
     end if;
@@ -5256,13 +5341,14 @@ begin
   begin
     if p_id is null then
       insert into amine.promotions (code, description, kind, value, max_discount, min_subtotal, zone_id, store_id,
-        starts_at, ends_at, max_uses, max_uses_per_customer, first_order_only, is_public, is_active, created_by)
+        starts_at, ends_at, max_uses, max_uses_per_customer, first_order_only, is_public, is_active, auto_apply, created_by)
       values (v_code, amine.txt(p_data ->> 'description', 'description', 120), v_kind, v_value,
         amine.int_in(p_data, 'max_discount', 1, 100000000, false), coalesce(amine.int_in(p_data, 'min_subtotal', 0, 100000000, false), 0),
         v_zone, v_store, v_starts, v_ends, amine.int_in(p_data, 'max_uses', 1, 1000000, false),
         coalesce(amine.int_in(p_data, 'max_uses_per_customer', 1, 100, false), 1),
-        coalesce((p_data ->> 'first_order_only')::boolean, false), coalesce((p_data ->> 'is_public')::boolean, false),
-        coalesce((p_data ->> 'is_active')::boolean, true), a.id)
+        coalesce((p_data ->> 'first_order_only')::boolean, false) or coalesce((p_data ->> 'auto_apply')::boolean, false),
+        coalesce((p_data ->> 'is_public')::boolean, false),
+        coalesce((p_data ->> 'is_active')::boolean, true), coalesce((p_data ->> 'auto_apply')::boolean, false), a.id)
       returning * into pr;
     else
       update amine.promotions set code = v_code, description = amine.txt(p_data ->> 'description', 'description', 120),
@@ -5270,7 +5356,9 @@ begin
         min_subtotal = coalesce(amine.int_in(p_data, 'min_subtotal', 0, 100000000, false), 0), zone_id = v_zone,
         store_id = v_store, starts_at = v_starts, ends_at = v_ends, max_uses = amine.int_in(p_data, 'max_uses', 1, 1000000, false),
         max_uses_per_customer = coalesce(amine.int_in(p_data, 'max_uses_per_customer', 1, 100, false), 1),
-        first_order_only = coalesce((p_data ->> 'first_order_only')::boolean, false),
+        -- Une offre automatique est toujours réservée à la première commande (offre de bienvenue).
+        first_order_only = coalesce((p_data ->> 'first_order_only')::boolean, false) or coalesce((p_data ->> 'auto_apply')::boolean, false),
+        auto_apply = coalesce((p_data ->> 'auto_apply')::boolean, false),
         is_public = coalesce((p_data ->> 'is_public')::boolean, false),
         is_active = coalesce((p_data ->> 'is_active')::boolean, true),
         archived_at = case when coalesce((p_data ->> 'is_active')::boolean, true) then null else archived_at end
@@ -5573,6 +5661,7 @@ begin
   return jsonb_build_object('platform', amine.setting('platform'), 'orders', amine.setting('orders'),
     'parcel', amine.setting('parcel'), 'couriers', amine.setting('couriers'), 'auth', amine.setting('auth'),
     'legal', amine.setting('legal'), 'invoicing', amine.setting('invoicing'), 'push', amine.setting('push'),
+    'loyalty', amine.setting('loyalty'),
     'push_status', jsonb_build_object(
       'pg_net', exists (select 1 from pg_extension where extname = 'pg_net'),
       'keys', exists (select 1 from amine.push_keys where id = 1 and public_key is not null),
@@ -5653,6 +5742,18 @@ begin
     if (v ->> 'enabled')::boolean and v ->> 'function_url' = '' then
       perform amine.err('INVALID_INPUT', 'function_url');
     end if;
+  elsif p_key = 'loyalty' then
+    v := jsonb_build_object('enabled', coalesce(amine.bool_in(p_value, 'enabled'), (amine.setting('loyalty') ->> 'enabled')::boolean),
+      'earn_per_dt', amine.int_in(p_value, 'earn_per_dt', 0, 100, true),
+      'point_value', amine.int_in(p_value, 'point_value', 1, 1000, true),
+      'min_redeem', amine.int_in(p_value, 'min_redeem', 1, 1000000, true),
+      'max_redeem_bps', amine.int_in(p_value, 'max_redeem_bps', 0, 10000, true),
+      'referral_enabled', coalesce(amine.bool_in(p_value, 'referral_enabled'), (amine.setting('loyalty') ->> 'referral_enabled')::boolean),
+      'referral_points', amine.int_in(p_value, 'referral_points', 0, 1000000, true),
+      'referral_min_subtotal', amine.int_in(p_value, 'referral_min_subtotal', 0, 100000000, true),
+      'referral_max', amine.int_in(p_value, 'referral_max', 1, 1000, true),
+      'remind_enabled', coalesce(amine.bool_in(p_value, 'remind_enabled'), (amine.setting('loyalty') ->> 'remind_enabled')::boolean),
+      'remind_days', amine.int_in(p_value, 'remind_days', 7, 180, true));
   elsif p_key = 'legal' then
     v := jsonb_build_object(
       'company_name', coalesce(amine.txt(p_value ->> 'company_name', 'company_name', 120), ''),
@@ -6224,6 +6325,8 @@ begin
   if i.customer_id is not null then
     insert into amine.account_entries (customer_id, kind, amount, invoice_id, reference, note, created_by)
     values (i.customer_id, 'credit_note', -p_amount, cn.id, cn.number, v_reason, a.id);
+    -- Marchandise reprise : les points gagnés sur ce montant sont retirés.
+    perform amine.loyalty_reverse(i.order_id, p_amount, cn.number);
     perform amine.notify(i.customer_id, 'credit_note_issued',
       jsonb_build_object('number', cn.number, 'amount', p_amount, 'invoice', i.number), '#/account/invoices/' || cn.id::text);
   end if;
@@ -6625,7 +6728,7 @@ declare
   v_qty numeric;
   it amine.order_items;
   v_sub bigint;
-  pr amine.promotions;
+  v_reprice jsonb;
   v_discount int;
 begin
   perform amine.hit('merchant_action:' || auth.uid(), 300, 600);
@@ -6664,15 +6767,13 @@ begin
     where id = it.id;
   end loop;
   select coalesce(sum(total), 0) into v_sub from amine.order_items where order_id = o.id;
-  if o.promo_code is not null then
-    select * into pr from amine.promotions where code = o.promo_code;
-  end if;
-  if pr.id is not null then
-    v_discount := amine.promo_discount(pr, v_sub::int, o.delivery_fee, o.service_fee);
-  else
-    v_discount := least(o.discount, v_sub::int + o.delivery_fee + o.service_fee);
+  v_reprice := amine.reprice_discount(o, v_sub::int);
+  v_discount := (v_reprice ->> 'discount')::int;
+  if (v_reprice ->> 'refund_points')::int > 0 then
+    perform amine.loyalty_add(o.customer_id, (v_reprice ->> 'refund_points')::int, 'edit_refund', o.id, o.code);
   end if;
   update amine.orders set subtotal = v_sub, discount = v_discount,
+    loyalty_discount = (v_reprice ->> 'loyalty_discount')::int, loyalty_points = (v_reprice ->> 'loyalty_points')::int,
     total = v_sub + delivery_fee + service_fee + stamp_fee - v_discount,
     commission = round(v_sub::numeric * s.commission_bps / 10000)::int, weights_adjusted_at = now(), updated_at = now()
   where id = o.id returning * into o;
@@ -7624,7 +7725,7 @@ begin
     v := v || jsonb_build_object(r.relname, t);
   end loop;
   perform amine.audit('data.exported_all', 'platform', 'amine', jsonb_build_object('tables', (select count(*) from jsonb_object_keys(v))));
-  return jsonb_build_object('app', 'amine', 'schema_version', 4, 'exported_at', now(), 'tables', v);
+  return jsonb_build_object('app', 'amine', 'schema_version', 5, 'exported_at', now(), 'tables', v);
 end $$;
 
 -- ── Notifications push (application fermée) ──────────────────────────────────────────────────
@@ -7814,6 +7915,14 @@ begin
     case when meta ->> 'business_type' in ('restaurant', 'cafe', 'hotel', 'snack', 'caterer', 'bakery', 'other')
       then meta ->> 'business_type' end)
   on conflict (id) do nothing;
+  -- Code de parrainage saisi à l'inscription (facultatif) : un code invalide ne bloque jamais l'inscription.
+  if nullif(btrim(coalesce(meta ->> 'referral_code', '')), '') is not null then
+    begin
+      perform amine.link_referral(new.id, meta ->> 'referral_code');
+    exception when others then
+      null;
+    end;
+  end if;
   return new;
 exception when others then
   -- Une donnée de profil invalide ne doit jamais bloquer une inscription (le profil sera
@@ -8162,3 +8271,2333 @@ revoke all on function public.admin_clear_client_errors() from public, anon, aut
 grant execute on function public.log_client_error(text, text, text, text, text, text, text) to anon, authenticated;
 grant execute on function public.admin_client_errors(int) to authenticated;
 grant execute on function public.admin_clear_client_errors() to authenticated;
+
+-- =============================================================================================
+--  Chèques, virements bancaires et avances (version 6)
+--
+--  • Chèque encaissé à la livraison : le livreur note le numéro et la banque ; le chèque entre dans
+--    un registre (collecté → reçu → déposé → encaissé ou impayé). Un chèque impayé remet la somme
+--    au compte du client. Les espèces du livreur ne comptent plus que ce qui a réellement été payé
+--    en espèces.
+--  • Virement : le client téléverse son justificatif (image ou PDF) ; l'administration le valide
+--    ou le refuse. Validé, il devient un règlement au compte du client. Un virement peut régler des
+--    factures ou constituer une avance ; l'avance solde automatiquement les prochaines factures.
+--  • Coordonnées bancaires d'AMINE (RIB / IBAN), affichées aux clients pour leurs virements.
+--
+--  Ce script remplace quelques fonctions des fichiers précédents (livraison par le livreur,
+--  facturation à la livraison, espèces des livreurs, export des données, suppression d'une écriture) ;
+--  il peut être rejoué sans risque.
+-- =============================================================================================
+
+-- ── Tables ────────────────────────────────────────────────────────────────────────────────────
+alter table amine.orders add column if not exists cheque_amount int not null default 0;
+alter table amine.orders drop constraint if exists orders_cheque_amount_check;
+alter table amine.orders add constraint orders_cheque_amount_check check (cheque_amount between 0 and 1000000000);
+
+create table if not exists amine.cheques (
+  id uuid primary key default gen_random_uuid(),
+  customer_id uuid references amine.profiles (id) on delete set null,
+  order_id uuid references amine.orders (id) on delete set null,
+  courier_id uuid references amine.profiles (id) on delete set null,
+  number text not null check (number ~ '^[0-9A-Za-z/-]{3,30}$'),
+  bank text not null check (char_length(bank) between 2 and 60),
+  amount int not null check (amount between 1 and 1000000000),
+  due_on date,
+  status text not null default 'received' check (status in ('collected', 'received', 'deposited', 'cleared', 'bounced')),
+  note text check (note is null or char_length(note) <= 300),
+  collected_at timestamptz not null default now(),
+  status_at timestamptz not null default now(),
+  created_by uuid
+);
+create index if not exists cheques_status_idx on amine.cheques (status, collected_at desc);
+create index if not exists cheques_customer_idx on amine.cheques (customer_id);
+create index if not exists cheques_order_idx on amine.cheques (order_id);
+create index if not exists cheques_courier_idx on amine.cheques (courier_id) where status = 'collected';
+create index if not exists cheques_number_idx on amine.cheques (lower(bank), lower(number));
+alter table amine.cheques enable row level security;
+revoke all on amine.cheques from public, anon, authenticated;
+
+create table if not exists amine.transfers (
+  id uuid primary key default gen_random_uuid(),
+  customer_id uuid references amine.profiles (id) on delete set null,
+  purpose text not null default 'invoices' check (purpose in ('invoices', 'advance')),
+  amount int not null check (amount between 1 and 1000000000),
+  reference text check (reference is null or char_length(reference) <= 80),
+  proof text not null check (char_length(proof) <= 200),
+  status text not null default 'pending' check (status in ('pending', 'confirmed', 'rejected')),
+  reject_reason text check (reject_reason is null or char_length(reject_reason) <= 300),
+  entry_id bigint references amine.account_entries (id) on delete set null,
+  created_at timestamptz not null default now(),
+  reviewed_at timestamptz,
+  reviewed_by uuid
+);
+create index if not exists transfers_status_idx on amine.transfers (status, created_at desc);
+create index if not exists transfers_customer_idx on amine.transfers (customer_id, created_at desc);
+alter table amine.transfers enable row level security;
+revoke all on amine.transfers from public, anon, authenticated;
+
+create table if not exists amine.bank_account (
+  id int primary key check (id = 1),
+  holder text not null default '',
+  bank text not null default '',
+  rib text not null default '',
+  iban text not null default '',
+  note text not null default '',
+  updated_at timestamptz not null default now(),
+  updated_by uuid
+);
+alter table amine.bank_account enable row level security;
+revoke all on amine.bank_account from public, anon, authenticated;
+
+-- Justificatifs de virement : même stockage privé que les preuves de livraison.
+update storage.buckets set allowed_mime_types = array['image/jpeg', 'image/png', 'image/webp', 'application/pdf']
+where id = 'amine-proofs';
+
+-- IBAN valide (contrôle modulo 97).
+create or replace function amine.valid_iban(p_iban text) returns boolean
+language plpgsql immutable set search_path = '' as $$
+declare
+  v text := upper(regexp_replace(coalesce(p_iban, ''), '\s', '', 'g'));
+  v_digits text := '';
+  v_char text;
+  i int;
+begin
+  if v !~ '^[A-Z]{2}[0-9]{2}[A-Z0-9]{10,30}$' then
+    return false;
+  end if;
+  v := substr(v, 5) || substr(v, 1, 4);
+  for i in 1..char_length(v) loop
+    v_char := substr(v, i, 1);
+    v_digits := v_digits || case when v_char ~ '[0-9]' then v_char else (ascii(v_char) - 55)::text end;
+  end loop;
+  return v_digits::numeric % 97 = 1;
+end $$;
+
+-- ── Droits de lecture et d'écriture des justificatifs ─────────────────────────────────────────
+--   orders/<id_commande>/(photo|signature)-…        preuves de livraison (inchangé)
+--   transfers/<id_client>/proof-…                   justificatifs de virement : déposés par le client,
+--                                                   lus par lui et par l'administration
+create or replace function public.amine_can_access_proof(p_name text, p_write boolean) returns boolean
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  v_uid uuid := auth.uid();
+  v_parts text[];
+  p amine.profiles;
+  o amine.orders;
+begin
+  if v_uid is null or p_name is null then
+    return false;
+  end if;
+  v_parts := string_to_array(p_name, '/');
+  if coalesce(array_length(v_parts, 1), 0) <> 3
+     or v_parts[2] !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    return false;
+  end if;
+  select * into p from amine.profiles where id = v_uid and status = 'active';
+  if not found or amine.mfa_state(p) <> 'ok' then
+    return false;
+  end if;
+  if v_parts[1] = 'transfers' then
+    if v_parts[3] !~ '^proof-[A-Za-z0-9_-]{6,40}\.(jpg|jpeg|png|webp|pdf)$' then
+      return false;
+    end if;
+    return v_parts[2]::uuid = v_uid or (not p_write and p.is_admin);
+  end if;
+  if v_parts[1] <> 'orders' or v_parts[3] !~ '^(photo|signature)-[A-Za-z0-9_-]{6,40}\.(jpg|jpeg|png|webp)$' then
+    return false;
+  end if;
+  select * into o from amine.orders where id = v_parts[2]::uuid;
+  if not found then
+    return false;
+  end if;
+  if p_write then
+    return o.courier_id = v_uid and o.status = 'picked_up';
+  end if;
+  return p.is_admin or o.customer_id = v_uid or o.courier_id = v_uid
+    or exists (select 1 from amine.store_staff st where st.store_id = o.store_id and st.user_id = v_uid);
+end $$;
+revoke all on function public.amine_can_access_proof(text, boolean) from public, anon, authenticated;
+grant execute on function public.amine_can_access_proof(text, boolean) to authenticated;
+
+-- ── Chèques : présentation ────────────────────────────────────────────────────────────────────
+create or replace function amine.cheque_json(c amine.cheques) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object('id', c.id, 'number', c.number, 'bank', c.bank, 'amount', c.amount, 'due_on', c.due_on,
+    'status', c.status, 'note', c.note, 'collected_at', c.collected_at, 'status_at', c.status_at,
+    'order_code', (select o.code from amine.orders o where o.id = c.order_id),
+    'customer', (select jsonb_build_object('id', p.id, 'name', coalesce(nullif(p.business_name, ''), p.full_name))
+      from amine.profiles p where p.id = c.customer_id),
+    'courier', (select jsonb_build_object('id', p.id, 'name', p.full_name) from amine.profiles p where p.id = c.courier_id),
+    'duplicate', exists (select 1 from amine.cheques d
+      where d.id <> c.id and lower(d.bank) = lower(c.bank) and lower(d.number) = lower(c.number)))
+$$;
+
+-- ── Espèces des livreurs : seulement ce qui a été payé en espèces ─────────────────────────────
+-- (remplace la version de 09_operations.sql ; les chèques en main sont listés à part)
+create or replace function amine.courier_cash_json(c amine.couriers) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object('collected', x.collected, 'handed_over', x.handed, 'in_hand', x.collected - x.handed,
+    'since', c.cash_since, 'last_handover_at', x.last_at, 'cheques', x.cheques)
+  from (select
+      coalesce((select sum(greatest(0, o.cod_collected - o.cheque_amount)) from amine.orders o where o.courier_id = c.user_id
+        and o.status = 'delivered' and o.cod_collected is not null and o.delivered_at >= c.cash_since), 0)::bigint as collected,
+      coalesce((select sum(h.amount) from amine.cash_handovers h where h.courier_id = c.user_id), 0)::bigint as handed,
+      (select max(h.created_at) from amine.cash_handovers h where h.courier_id = c.user_id) as last_at,
+      coalesce((select jsonb_agg(amine.cheque_json(k) order by k.collected_at) from amine.cheques k
+        where k.courier_id = c.user_id and k.status = 'collected'), '[]'::jsonb) as cheques) x
+$$;
+
+create or replace function public.merchant_courier_cash(p_store_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+begin
+  return jsonb_build_object(
+    'couriers', coalesce((
+      select jsonb_agg(x.j order by (x.j ->> 'in_hand')::bigint desc, x.j ->> 'name')
+      from (select amine.courier_cash_json(c) || jsonb_build_object('courier_id', c.user_id, 'name', p.full_name,
+                'phone', p.phone,
+                'collected_here', coalesce((select sum(greatest(0, o.cod_collected - o.cheque_amount)) from amine.orders o
+                  where o.store_id = s.id and o.courier_id = c.user_id and o.status = 'delivered'
+                    and o.delivered_at >= c.cash_since), 0),
+                'handed_here', coalesce((select sum(h.amount) from amine.cash_handovers h
+                  where h.store_id = s.id and h.courier_id = c.user_id), 0),
+                -- Le dépôt ne voit que les chèques de ses propres commandes.
+                'cheques', coalesce((select jsonb_agg(amine.cheque_json(k) order by k.collected_at) from amine.cheques k
+                  join amine.orders ko on ko.id = k.order_id
+                  where k.courier_id = c.user_id and k.status = 'collected' and ko.store_id = s.id), '[]'::jsonb)) as j
+            from amine.couriers c join amine.profiles p on p.id = c.user_id
+            where exists (select 1 from amine.orders o where o.store_id = s.id and o.courier_id = c.user_id
+              and o.status = 'delivered' and o.delivered_at >= now() - interval '60 days')) x), '[]'::jsonb),
+    'handovers', coalesce((
+      select jsonb_agg(amine.handover_json(h) order by h.created_at desc)
+      from (select * from amine.cash_handovers where store_id = s.id order by created_at desc limit 100) h), '[]'::jsonb));
+end $$;
+revoke all on function public.merchant_courier_cash(uuid) from public, anon, authenticated;
+grant execute on function public.merchant_courier_cash(uuid) to authenticated;
+
+-- ── Livraison : espèces, chèque, ou les deux ──────────────────────────────────────────────────
+-- p_cod_collected : total reçu à la porte (espèces + chèque). p_cheque : {"number", "bank",
+-- "amount" (par défaut tout le montant reçu), "due_on" (chèque à date, facultatif)}.
+drop function if exists public.courier_update_job(text, text, int, jsonb);
+create or replace function public.courier_update_job(p_code text, p_action text, p_cod_collected int default null,
+  p_pod jsonb default null, p_cheque jsonb default null) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  c amine.couriers := amine.require_courier();
+  o amine.orders;
+  v_name text;
+  v_photo text;
+  v_signature text;
+  v_number text;
+  v_bank text;
+  v_cheque int;
+  v_due date;
+  v_today date := (now() at time zone 'Africa/Tunis')::date;
+begin
+  perform amine.hit('courier_action:' || c.user_id, 120, 600);
+  select * into o from amine.orders where code = upper(btrim(coalesce(p_code, ''))) and courier_id = c.user_id for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if p_action = 'picked_up' then
+    o := amine.transition(o, 'picked_up', 'courier', c.user_id);
+  elsif p_action = 'delivered' then
+    if p_pod is not null and jsonb_typeof(p_pod) <> 'object' then
+      perform amine.err('INVALID_INPUT', 'pod');
+    end if;
+    v_name := amine.txt(p_pod ->> 'name', 'pod_name', 80);
+    v_photo := amine.pod_file(o.id, p_pod, 'photo');
+    v_signature := amine.pod_file(o.id, p_pod, 'signature');
+    if coalesce((amine.setting('orders') ->> 'require_pod')::boolean, false)
+       and (v_name is null or (v_photo is null and v_signature is null)) then
+      perform amine.err('POD_REQUIRED');
+    end if;
+    if v_name is not null or v_photo is not null or v_signature is not null then
+      update amine.orders set pod_name = v_name, pod_photo = v_photo, pod_signature = v_signature, pod_at = now()
+      where id = o.id returning * into o;
+    end if;
+    if o.payment_method = 'account' then
+      if coalesce(p_cod_collected, 0) <> 0 or p_cheque is not null then
+        perform amine.err('NOTHING_TO_COLLECT');
+      end if;
+      o := amine.transition(o, 'delivered', 'courier', c.user_id);
+    else
+      if p_cod_collected is null or p_cod_collected < 0 or p_cod_collected > 100000000 then
+        perform amine.err('COD_AMOUNT_REQUIRED');
+      end if;
+      if p_cheque is not null then
+        if jsonb_typeof(p_cheque) <> 'object' then
+          perform amine.err('INVALID_INPUT', 'cheque');
+        end if;
+        v_number := regexp_replace(coalesce(p_cheque ->> 'number', ''), '\s', '', 'g');
+        if v_number !~ '^[0-9A-Za-z/-]{3,30}$' then
+          perform amine.err('INVALID_INPUT', 'cheque_number');
+        end if;
+        v_bank := amine.txt(p_cheque ->> 'bank', 'cheque_bank', 60, true, 2);
+        v_cheque := coalesce(amine.int_in(jsonb_build_object('cheque_amount', p_cheque ->> 'amount'), 'cheque_amount', 1, 100000000, false),
+          p_cod_collected);
+        if v_cheque < 1 or v_cheque > p_cod_collected then
+          perform amine.err('INVALID_INPUT', 'cheque_amount');
+        end if;
+        v_due := amine.date_in(jsonb_build_object('cheque_due', p_cheque ->> 'due_on'), 'cheque_due');
+        if v_due is not null and (v_due < v_today - 30 or v_due > v_today + 400) then
+          perform amine.err('INVALID_INPUT', 'cheque_due');
+        end if;
+        insert into amine.cheques (customer_id, order_id, courier_id, number, bank, amount, due_on, status, created_by)
+        values (o.customer_id, o.id, c.user_id, v_number, v_bank, v_cheque, v_due, 'collected', c.user_id);
+        update amine.orders set cheque_amount = v_cheque where id = o.id;
+        o.cheque_amount := v_cheque;
+      end if;
+      update amine.orders set cod_collected = p_cod_collected where id = o.id;
+      o.cod_collected := p_cod_collected;
+      o := amine.transition(o, 'delivered', 'courier', c.user_id,
+        case when p_cod_collected <> o.total then 'cod_mismatch:' || p_cod_collected::text end);
+    end if;
+  else
+    perform amine.err('INVALID_INPUT', 'action');
+  end if;
+  return amine.order_json(o, 'courier');
+end $$;
+revoke all on function public.courier_update_job(text, text, int, jsonb, jsonb) from public, anon, authenticated;
+grant execute on function public.courier_update_job(text, text, int, jsonb, jsonb) to authenticated;
+
+-- Facture, écriture au compte et règlement à la livraison (remplace la version de 08_business.sql :
+-- la part payée par chèque est enregistrée comme règlement par chèque, le reste comme espèces).
+create or replace function amine.after_delivery(o amine.orders) returns void
+language plpgsql set search_path = '' as $$
+declare
+  inv amine.invoices := amine.issue_invoice(o);
+  v_cheque int := least(coalesce(o.cheque_amount, 0), coalesce(o.cod_collected, 0));
+  v_number text;
+begin
+  if o.customer_id is null then
+    return;
+  end if;
+  if inv.total_ttc > 0 then
+    insert into amine.account_entries (customer_id, kind, amount, invoice_id, reference, created_by)
+    values (o.customer_id, 'invoice', inv.total_ttc, inv.id, inv.number, auth.uid());
+  end if;
+  if o.payment_method = 'cod' and coalesce(o.cod_collected, 0) > 0 then
+    if v_cheque > 0 then
+      select k.number into v_number from amine.cheques k where k.order_id = o.id order by k.collected_at desc limit 1;
+      insert into amine.account_entries (customer_id, kind, amount, invoice_id, method, reference, note, created_by)
+      values (o.customer_id, 'payment', -v_cheque, inv.id, 'cheque', coalesce(v_number, o.code), 'cod', auth.uid());
+    end if;
+    if o.cod_collected - v_cheque > 0 then
+      insert into amine.account_entries (customer_id, kind, amount, invoice_id, method, reference, note, created_by)
+      values (o.customer_id, 'payment', -(o.cod_collected - v_cheque), inv.id, 'cash', o.code, 'cod', auth.uid());
+    end if;
+  end if;
+  perform amine.notify(o.customer_id, 'invoice_issued',
+    jsonb_build_object('number', inv.number, 'total', inv.total_ttc, 'due_on', inv.due_on, 'code', o.code),
+    '#/account/invoices/' || inv.id::text);
+end $$;
+
+-- Un règlement par chèque, par virement ou une avance ne s'efface pas : on le corrige par un ajustement
+-- (remplace la version de 08_business.sql).
+create or replace function public.admin_delete_account_entry(p_id bigint) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  e amine.account_entries;
+begin
+  select * into e from amine.account_entries where id = p_id for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if e.kind not in ('payment', 'adjustment') or (e.kind = 'payment' and e.note in ('cod', 'cheque', 'transfer', 'advance'))
+     or (e.kind = 'adjustment' and e.note = 'cheque_bounced') then
+    perform amine.err('ENTRY_LOCKED');
+  end if;
+  delete from amine.account_entries where id = e.id;
+  perform amine.audit('account.entry_deleted', 'profile', e.customer_id::text,
+    jsonb_build_object('kind', e.kind, 'amount', e.amount, 'reference', e.reference));
+  return amine.account_json(e.customer_id);
+end $$;
+revoke all on function public.admin_delete_account_entry(bigint) from public, anon, authenticated;
+grant execute on function public.admin_delete_account_entry(bigint) to authenticated;
+
+-- ── Chèques : registre (administration) et réception au dépôt ─────────────────────────────────
+create or replace function public.admin_cheques(p_status text default null, p_limit int default 200) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+begin
+  if p_status is not null and p_status not in ('collected', 'received', 'deposited', 'cleared', 'bounced') then
+    perform amine.err('INVALID_INPUT', 'status');
+  end if;
+  return jsonb_build_object(
+    'items', coalesce((
+      select jsonb_agg(amine.cheque_json(k) order by k.collected_at desc)
+      from (select * from amine.cheques where p_status is null or status = p_status
+            order by collected_at desc limit least(greatest(coalesce(p_limit, 200), 1), 500)) k), '[]'::jsonb),
+    'totals', coalesce((
+      select jsonb_object_agg(t.status, jsonb_build_object('count', t.n, 'amount', t.total))
+      from (select status, count(*) as n, sum(amount) as total from amine.cheques group by status) t), '{}'::jsonb));
+end $$;
+
+-- p_data : {"number", "bank", "amount", "due_on", "note", "order_code"}. Le chèque est dans les mains de
+-- l'équipe (statut « reçu ») et le règlement est inscrit tout de suite au compte du client.
+create or replace function public.admin_add_cheque(p_customer uuid, p_data jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_number text;
+  v_bank text;
+  v_amount int;
+  v_due date;
+  v_order amine.orders;
+  k amine.cheques;
+  v_today date := (now() at time zone 'Africa/Tunis')::date;
+begin
+  perform amine.hit('admin_cheque:' || a.id, 200, 3600);
+  if p_data is null or jsonb_typeof(p_data) <> 'object' then
+    perform amine.err('INVALID_INPUT', 'data');
+  end if;
+  if not exists (select 1 from amine.profiles where id = p_customer) then
+    perform amine.err('NOT_FOUND');
+  end if;
+  v_number := regexp_replace(coalesce(p_data ->> 'number', ''), '\s', '', 'g');
+  if v_number !~ '^[0-9A-Za-z/-]{3,30}$' then
+    perform amine.err('INVALID_INPUT', 'number');
+  end if;
+  v_bank := amine.txt(p_data ->> 'bank', 'bank', 60, true, 2);
+  v_amount := amine.int_in(p_data, 'amount', 1, 1000000000, true);
+  v_due := amine.date_in(p_data, 'due_on');
+  if v_due is not null and (v_due < v_today - 366 or v_due > v_today + 400) then
+    perform amine.err('INVALID_INPUT', 'due_on');
+  end if;
+  if nullif(btrim(coalesce(p_data ->> 'order_code', '')), '') is not null then
+    select * into v_order from amine.orders
+    where code = upper(btrim(p_data ->> 'order_code')) and customer_id = p_customer;
+    if not found then
+      perform amine.err('NOT_FOUND', 'order_code');
+    end if;
+  end if;
+  insert into amine.cheques (customer_id, order_id, number, bank, amount, due_on, status, note, created_by)
+  values (p_customer, v_order.id, v_number, v_bank, v_amount, v_due, 'received', amine.txt(p_data ->> 'note', 'note', 300), a.id)
+  returning * into k;
+  insert into amine.account_entries (customer_id, kind, amount, method, reference, note, created_by)
+  values (p_customer, 'payment', -v_amount, 'cheque', v_number, 'cheque', a.id);
+  perform amine.notify(p_customer, 'payment_recorded', jsonb_build_object('amount', v_amount, 'method', 'cheque'), '#/account/billing');
+  perform amine.audit('cheque.added', 'cheque', k.id::text, jsonb_build_object('number', v_number, 'bank', v_bank, 'amount', v_amount));
+  return amine.cheque_json(k);
+end $$;
+
+-- collected → received → deposited → cleared | bounced
+create or replace function public.admin_set_cheque_status(p_id uuid, p_status text, p_note text default null) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  k amine.cheques;
+begin
+  select * into k from amine.cheques where id = p_id for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if not ((k.status = 'collected' and p_status = 'received') or (k.status = 'received' and p_status = 'deposited')
+          or (k.status = 'deposited' and p_status in ('cleared', 'bounced'))) then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  update amine.cheques set status = p_status, status_at = now(), note = coalesce(amine.txt(p_note, 'note', 300), note)
+  where id = k.id returning * into k;
+  if p_status = 'bounced' and k.customer_id is not null then
+    -- Chèque impayé : la somme est de nouveau due par le client.
+    insert into amine.account_entries (customer_id, kind, amount, reference, note, created_by)
+    values (k.customer_id, 'adjustment', k.amount, k.number, 'cheque_bounced', a.id);
+    perform amine.notify(k.customer_id, 'cheque_bounced', jsonb_build_object('number', k.number, 'amount', k.amount, 'bank', k.bank),
+      '#/account/billing');
+  end if;
+  perform amine.audit('cheque.status', 'cheque', k.id::text, jsonb_build_object('status', p_status, 'number', k.number));
+  return amine.cheque_json(k);
+end $$;
+
+-- Le dépôt confirme avoir reçu du livreur un chèque d'une de ses commandes.
+create or replace function public.merchant_receive_cheque(p_store_id uuid, p_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  k amine.cheques;
+begin
+  select k2.* into k from amine.cheques k2 join amine.orders o on o.id = k2.order_id
+  where k2.id = p_id and o.store_id = s.id for update of k2;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if k.status <> 'collected' then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  update amine.cheques set status = 'received', status_at = now() where id = k.id returning * into k;
+  perform amine.audit('cheque.status', 'cheque', k.id::text, jsonb_build_object('status', 'received', 'number', k.number, 'store_id', s.id));
+  return amine.cheque_json(k);
+end $$;
+
+-- ── Coordonnées bancaires d'AMINE ─────────────────────────────────────────────────────────────
+create or replace function public.payment_info() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+  b amine.bank_account;
+begin
+  select * into b from amine.bank_account where id = 1;
+  if not found or (b.rib = '' and b.iban = '') then
+    return jsonb_build_object('bank', null);
+  end if;
+  return jsonb_build_object('bank', jsonb_build_object('holder', b.holder, 'bank', b.bank, 'rib', b.rib, 'iban', b.iban, 'note', b.note));
+end $$;
+
+-- p_data : {"holder", "bank", "rib" (20 chiffres), "iban" (TN…), "note"}
+create or replace function public.admin_save_bank(p_data jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_rib text;
+  v_iban text;
+  v_holder text;
+  v_bank text;
+  v_note text;
+begin
+  if p_data is null or jsonb_typeof(p_data) <> 'object' then
+    perform amine.err('INVALID_INPUT', 'data');
+  end if;
+  v_rib := regexp_replace(coalesce(p_data ->> 'rib', ''), '[\s.-]', '', 'g');
+  v_iban := upper(regexp_replace(coalesce(p_data ->> 'iban', ''), '\s', '', 'g'));
+  if v_rib <> '' and v_rib !~ '^[0-9]{20}$' then
+    perform amine.err('INVALID_INPUT', 'rib');
+  end if;
+  if v_iban <> '' and (v_iban !~ '^TN[0-9]{22}$' or not amine.valid_iban(v_iban)) then
+    perform amine.err('INVALID_INPUT', 'iban');
+  end if;
+  -- Quand les deux sont donnés, l'IBAN tunisien se compose de « TN » + clé + RIB.
+  if v_rib <> '' and v_iban <> '' and substr(v_iban, 5) <> v_rib then
+    perform amine.err('INVALID_INPUT', 'iban');
+  end if;
+  v_holder := coalesce(amine.txt(p_data ->> 'holder', 'holder', 120), '');
+  v_bank := coalesce(amine.txt(p_data ->> 'bank', 'bank', 80), '');
+  v_note := coalesce(amine.txt(p_data ->> 'note', 'note', 200), '');
+  insert into amine.bank_account (id, holder, bank, rib, iban, note, updated_at, updated_by)
+  values (1, v_holder, v_bank, v_rib, v_iban, v_note, now(), a.id)
+  on conflict (id) do update set holder = excluded.holder, bank = excluded.bank, rib = excluded.rib, iban = excluded.iban,
+    note = excluded.note, updated_at = now(), updated_by = a.id;
+  perform amine.audit('bank.updated', 'settings', 'bank', jsonb_build_object('has_rib', v_rib <> '', 'has_iban', v_iban <> ''));
+  return jsonb_build_object('holder', v_holder, 'bank', v_bank, 'rib', v_rib, 'iban', v_iban, 'note', v_note);
+end $$;
+
+create or replace function public.admin_bank() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  b amine.bank_account;
+begin
+  select * into b from amine.bank_account where id = 1;
+  return jsonb_build_object('holder', coalesce(b.holder, ''), 'bank', coalesce(b.bank, ''), 'rib', coalesce(b.rib, ''),
+    'iban', coalesce(b.iban, ''), 'note', coalesce(b.note, ''));
+end $$;
+
+-- ── Virements : justificatif du client, validation par l'administration ───────────────────────
+create or replace function amine.transfer_json(t amine.transfers) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object('id', t.id, 'purpose', t.purpose, 'amount', t.amount, 'reference', t.reference, 'proof', t.proof,
+    'status', t.status, 'reject_reason', t.reject_reason, 'created_at', t.created_at, 'reviewed_at', t.reviewed_at,
+    'customer', (select jsonb_build_object('id', p.id, 'name', coalesce(nullif(p.business_name, ''), p.full_name))
+      from amine.profiles p where p.id = t.customer_id))
+$$;
+
+-- Le justificatif est d'abord déposé dans le stockage privé (transfers/<mon id>/proof-….<ext>), puis déclaré ici.
+create or replace function public.submit_transfer(p_amount int, p_proof text, p_reference text default null,
+  p_purpose text default 'invoices') returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+  t amine.transfers;
+  v_proof text := btrim(coalesce(p_proof, ''));
+  v_purpose text := coalesce(p_purpose, 'invoices');
+begin
+  perform amine.hit('transfer:' || p.id, 20, 3600);
+  if p_amount is null or p_amount < 1 or p_amount > 1000000000 then
+    perform amine.err('INVALID_INPUT', 'amount');
+  end if;
+  if v_purpose not in ('invoices', 'advance') then
+    perform amine.err('INVALID_INPUT', 'purpose');
+  end if;
+  if v_proof !~ ('^transfers/' || p.id::text || '/proof-[A-Za-z0-9_-]{6,40}\.(jpg|jpeg|png|webp|pdf)$')
+     or not exists (select 1 from storage.objects o where o.bucket_id = 'amine-proofs' and o.name = v_proof) then
+    perform amine.err('INVALID_INPUT', 'proof');
+  end if;
+  if exists (select 1 from amine.transfers x where x.proof = v_proof) then
+    perform amine.err('INVALID_INPUT', 'proof');
+  end if;
+  if (select count(*) from amine.transfers x where x.customer_id = p.id and x.status = 'pending') >= 5 then
+    perform amine.err('TOO_MANY_PENDING');
+  end if;
+  insert into amine.transfers (customer_id, purpose, amount, reference, proof)
+  values (p.id, v_purpose, p_amount, amine.txt(p_reference, 'reference', 80), v_proof)
+  returning * into t;
+  perform amine.notify_admins('transfer_submitted',
+    jsonb_build_object('client', coalesce(nullif(p.business_name, ''), p.full_name), 'amount', p_amount),
+    '#/admin/billing?tab=transfers');
+  return amine.transfer_json(t);
+end $$;
+
+create or replace function public.my_transfers() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+begin
+  return coalesce((
+    select jsonb_agg(amine.transfer_json(t) order by t.created_at desc)
+    from (select * from amine.transfers where customer_id = p.id order by created_at desc limit 50) t), '[]'::jsonb);
+end $$;
+
+create or replace function public.admin_transfers(p_status text default null, p_limit int default 100) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+begin
+  if p_status is not null and p_status not in ('pending', 'confirmed', 'rejected') then
+    perform amine.err('INVALID_INPUT', 'status');
+  end if;
+  return coalesce((
+    select jsonb_agg(amine.transfer_json(t) order by (t.status = 'pending') desc, t.created_at desc)
+    from (select * from amine.transfers where p_status is null or status = p_status
+          order by (status = 'pending') desc, created_at desc limit least(greatest(coalesce(p_limit, 100), 1), 300)) t), '[]'::jsonb);
+end $$;
+
+-- p_action : confirm | reject. À la confirmation, le montant peut être corrigé (montant réellement reçu).
+create or replace function public.admin_review_transfer(p_id uuid, p_action text, p_reason text default null,
+  p_amount int default null) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  t amine.transfers;
+  v_amount int;
+  v_entry bigint;
+  v_reason text := amine.txt(p_reason, 'reason', 300);
+begin
+  perform amine.hit('admin_transfer:' || a.id, 300, 3600);
+  select * into t from amine.transfers where id = p_id for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if t.status <> 'pending' then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  if p_action = 'confirm' then
+    if t.customer_id is null then
+      perform amine.err('NOT_FOUND');
+    end if;
+    v_amount := coalesce(p_amount, t.amount);
+    if v_amount < 1 or v_amount > 1000000000 then
+      perform amine.err('INVALID_INPUT', 'amount');
+    end if;
+    insert into amine.account_entries (customer_id, kind, amount, method, reference, note, created_by)
+    values (t.customer_id, 'payment', -v_amount, 'transfer', t.reference,
+      case when t.purpose = 'advance' then 'advance' else 'transfer' end, a.id)
+    returning id into v_entry;
+    update amine.transfers set status = 'confirmed', amount = v_amount, entry_id = v_entry, reviewed_at = now(), reviewed_by = a.id
+    where id = t.id returning * into t;
+    perform amine.notify(t.customer_id, 'transfer_confirmed', jsonb_build_object('amount', v_amount), '#/account/billing');
+    perform amine.audit('transfer.confirmed', 'transfer', t.id::text, jsonb_build_object('amount', v_amount, 'purpose', t.purpose));
+  elsif p_action = 'reject' then
+    if v_reason is null then
+      perform amine.err('REASON_REQUIRED');
+    end if;
+    update amine.transfers set status = 'rejected', reject_reason = v_reason, reviewed_at = now(), reviewed_by = a.id
+    where id = t.id returning * into t;
+    perform amine.notify(t.customer_id, 'transfer_rejected', jsonb_build_object('reason', v_reason, 'amount', t.amount), '#/account/billing');
+    perform amine.audit('transfer.rejected', 'transfer', t.id::text, jsonb_build_object('reason', v_reason));
+  else
+    perform amine.err('INVALID_INPUT', 'action');
+  end if;
+  return amine.transfer_json(t);
+end $$;
+
+-- ── Export des données personnelles : chèques, virements, points et parrainages en plus ─────────────────────────────
+-- (remplace la version de 04_customer.sql)
+create or replace function public.export_my_data() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+begin
+  perform amine.hit('export:' || p.id, 5, 3600);
+  return jsonb_build_object(
+    'exported_at', now(),
+    'profile', to_jsonb(p),
+    'addresses', coalesce((select jsonb_agg(to_jsonb(a)) from amine.addresses a where a.user_id = p.id), '[]'::jsonb),
+    'orders', coalesce((select jsonb_agg(amine.order_json(o, 'customer') order by o.placed_at)
+      from amine.orders o where o.customer_id = p.id), '[]'::jsonb),
+    'courier', (select to_jsonb(c) from amine.couriers c where c.user_id = p.id),
+    'deliveries', coalesce((select jsonb_agg(jsonb_build_object('code', o.code, 'status', o.status,
+        'delivered_at', o.delivered_at, 'courier_earning', o.courier_earning, 'cod_collected', o.cod_collected))
+      from amine.orders o where o.courier_id = p.id), '[]'::jsonb),
+    'stores', coalesce((select jsonb_agg(jsonb_build_object('store_id', st.store_id, 'role', st.role))
+      from amine.store_staff st where st.user_id = p.id), '[]'::jsonb),
+    'favorites', coalesce((select jsonb_agg(jsonb_build_object('product', pr.name, 'added_at', f.created_at))
+      from amine.favorites f join amine.products pr on pr.id = f.product_id where f.user_id = p.id), '[]'::jsonb),
+    'complaints', coalesce((select jsonb_agg(amine.complaint_json(c)) from amine.complaints c
+      where c.customer_id = p.id), '[]'::jsonb),
+    'notifications', coalesce((select jsonb_agg(jsonb_build_object('kind', n.kind, 'params', n.params,
+        'created_at', n.created_at)) from amine.notifications n where n.user_id = p.id), '[]'::jsonb),
+    'invoices', coalesce((select jsonb_agg(amine.invoice_json(i) order by i.issued_at)
+      from amine.invoices i where i.customer_id = p.id), '[]'::jsonb),
+    'account_entries', coalesce((select jsonb_agg(jsonb_build_object('kind', e.kind, 'amount', e.amount,
+        'method', e.method, 'reference', e.reference, 'occurred_on', e.occurred_on) order by e.occurred_on, e.id)
+      from amine.account_entries e where e.customer_id = p.id), '[]'::jsonb),
+    'recurring_orders', coalesce((select jsonb_agg(amine.recurring_json(r) order by r.created_at)
+      from amine.recurring_orders r where r.customer_id = p.id), '[]'::jsonb),
+    'negotiated_prices', coalesce((select jsonb_agg(jsonb_build_object('product', pr.name, 'price', cp.price))
+      from amine.client_prices cp join amine.products pr on pr.id = cp.product_id where cp.customer_id = p.id), '[]'::jsonb),
+    'cheques', coalesce((select jsonb_agg(jsonb_build_object('number', k.number, 'bank', k.bank, 'amount', k.amount,
+        'due_on', k.due_on, 'status', k.status, 'collected_at', k.collected_at) order by k.collected_at)
+      from amine.cheques k where k.customer_id = p.id), '[]'::jsonb),
+    'transfers', coalesce((select jsonb_agg(jsonb_build_object('amount', t.amount, 'purpose', t.purpose, 'reference', t.reference,
+        'status', t.status, 'created_at', t.created_at) order by t.created_at)
+      from amine.transfers t where t.customer_id = p.id), '[]'::jsonb),
+    'loyalty', jsonb_build_object('referral_code', p.referral_code,
+      'balance', amine.loyalty_balance(p.id),
+      'ledger', coalesce((select jsonb_agg(jsonb_build_object('points', l.delta, 'kind', l.kind, 'order', l.ref,
+          'at', l.created_at) order by l.id) from amine.loyalty_ledger l where l.customer_id = p.id), '[]'::jsonb),
+      'referrals', coalesce((select jsonb_agg(jsonb_build_object('role', case when r.referrer_id = p.id then 'referrer'
+          else 'referee' end, 'status', r.status, 'at', r.created_at) order by r.created_at)
+        from amine.referrals r where r.referrer_id = p.id or r.referee_id = p.id), '[]'::jsonb)));
+end $$;
+revoke all on function public.export_my_data() from public, anon, authenticated;
+grant execute on function public.export_my_data() to authenticated;
+
+-- ── Droits ────────────────────────────────────────────────────────────────────────────────────
+revoke all on function amine.valid_iban(text) from public, anon, authenticated;
+revoke all on function public.admin_cheques(text, int) from public, anon, authenticated;
+revoke all on function public.admin_add_cheque(uuid, jsonb) from public, anon, authenticated;
+revoke all on function public.admin_set_cheque_status(uuid, text, text) from public, anon, authenticated;
+revoke all on function public.merchant_receive_cheque(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.payment_info() from public, anon, authenticated;
+revoke all on function public.admin_save_bank(jsonb) from public, anon, authenticated;
+revoke all on function public.admin_bank() from public, anon, authenticated;
+revoke all on function public.submit_transfer(int, text, text, text) from public, anon, authenticated;
+revoke all on function public.my_transfers() from public, anon, authenticated;
+revoke all on function public.admin_transfers(text, int) from public, anon, authenticated;
+revoke all on function public.admin_review_transfer(uuid, text, text, int) from public, anon, authenticated;
+grant execute on function public.admin_cheques(text, int) to authenticated;
+grant execute on function public.admin_add_cheque(uuid, jsonb) to authenticated;
+grant execute on function public.admin_set_cheque_status(uuid, text, text) to authenticated;
+grant execute on function public.merchant_receive_cheque(uuid, uuid) to authenticated;
+grant execute on function public.payment_info() to authenticated;
+grant execute on function public.admin_save_bank(jsonb) to authenticated;
+grant execute on function public.admin_bank() to authenticated;
+grant execute on function public.submit_transfer(int, text, text, text) to authenticated;
+grant execute on function public.my_transfers() to authenticated;
+grant execute on function public.admin_transfers(text, int) to authenticated;
+grant execute on function public.admin_review_transfer(uuid, text, text, int) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- =============================================================================================
+--  Hygiène alimentaire : allergènes, températures, lots en quarantaine, rappel de lot (version 7)
+--
+--  • Allergènes : chaque produit porte la liste des 14 allergènes à déclaration obligatoire et une
+--    classe de température (ambiant, frais, surgelé). Un produit dont les allergènes n'ont jamais
+--    été vérifiés est signalé « non renseigné » (ce n'est pas la même chose que « aucun allergène »).
+--  • Températures : relevés à la réception, au stockage et à la livraison (frais 0 à 5 °C, surgelé
+--    -18 °C ou moins). Un relevé hors limites exige une action corrective et alerte l'administration.
+--  • Lots : un lot suspect est mis en quarantaine (il sort du stock vendable et n'est plus servi),
+--    puis remis en vente ou détruit. Le rappel de lot le met en quarantaine et prévient en un clic
+--    tous les restaurants à qui il a été livré (liste des commandes tirée des mouvements de stock).
+--
+--  Ce script remplace quelques fonctions des fichiers précédents (fiche produit, mouvements de stock,
+--  tournée du livreur) ; il peut être rejoué sans risque.
+-- =============================================================================================
+
+-- ── Produits : allergènes et classe de température ───────────────────────────────────────────
+alter table amine.products add column if not exists allergens text[] not null default '{}';
+alter table amine.products add column if not exists allergens_reviewed_at timestamptz;
+alter table amine.products add column if not exists temp_class text not null default 'ambient';
+alter table amine.products drop constraint if exists products_allergens_check;
+alter table amine.products add constraint products_allergens_check check (allergens <@ array[
+  'gluten', 'crustaceans', 'eggs', 'fish', 'peanuts', 'soy', 'milk', 'nuts', 'celery', 'mustard',
+  'sesame', 'sulphites', 'lupin', 'molluscs']::text[]);
+alter table amine.products drop constraint if exists products_temp_class_check;
+alter table amine.products add constraint products_temp_class_check check (temp_class in ('ambient', 'chilled', 'frozen'));
+
+-- ── Lots : quarantaine, destruction, rappel ──────────────────────────────────────────────────
+alter table amine.purchase_lines add column if not exists quarantined_at timestamptz;
+alter table amine.purchase_lines add column if not exists quarantine_reason text;
+alter table amine.purchase_lines add column if not exists quarantined_qty int not null default 0;
+alter table amine.purchase_lines add column if not exists disposed_at timestamptz;
+alter table amine.purchase_lines add column if not exists recall_id uuid;
+alter table amine.purchase_lines drop constraint if exists purchase_lines_quarantine_reason_check;
+alter table amine.purchase_lines add constraint purchase_lines_quarantine_reason_check
+  check (quarantine_reason is null or char_length(quarantine_reason) <= 200);
+alter table amine.purchase_lines drop constraint if exists purchase_lines_quarantined_qty_check;
+alter table amine.purchase_lines add constraint purchase_lines_quarantined_qty_check check (quarantined_qty between 0 and 1000000);
+create index if not exists purchase_lines_hold_idx on amine.purchase_lines (product_id) where quarantined_at is not null;
+
+alter table amine.stock_movements drop constraint if exists stock_movements_kind_check;
+alter table amine.stock_movements add constraint stock_movements_kind_check
+  check (kind in ('sale', 'return', 'purchase', 'purchase_cancel', 'loss', 'count', 'adjustment', 'quarantine', 'release'));
+
+create table if not exists amine.lot_recalls (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references amine.stores (id) on delete cascade,
+  purchase_line_id uuid references amine.purchase_lines (id) on delete set null,
+  product_id uuid references amine.products (id) on delete set null,
+  product_name text not null,
+  lot text,
+  expiry_on date,
+  reason text not null check (char_length(reason) between 3 and 200),
+  orders_count int not null default 0,
+  customers_count int not null default 0,
+  quantity int not null default 0,
+  disposed boolean not null default false,
+  created_by uuid,
+  created_at timestamptz not null default now()
+);
+create index if not exists lot_recalls_store_idx on amine.lot_recalls (store_id, created_at desc);
+alter table amine.lot_recalls enable row level security;
+
+-- ── Relevés de température ───────────────────────────────────────────────────────────────────
+create table if not exists amine.temperature_logs (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references amine.stores (id) on delete cascade,
+  kind text not null check (kind in ('reception', 'storage', 'delivery')),
+  temp_class text not null check (temp_class in ('chilled', 'frozen')),
+  temperature numeric(5, 1) not null check (temperature between -60 and 100),
+  within_limits boolean not null,
+  location text check (location is null or char_length(location) <= 60),
+  purchase_id uuid references amine.purchases (id) on delete set null,
+  product_id uuid references amine.products (id) on delete set null,
+  order_id uuid references amine.orders (id) on delete cascade,
+  corrective text check (corrective is null or char_length(corrective) <= 200),
+  created_by uuid,
+  created_at timestamptz not null default now()
+);
+create index if not exists temperature_logs_store_idx on amine.temperature_logs (store_id, created_at desc);
+create unique index if not exists temperature_logs_delivery_idx on amine.temperature_logs (order_id) where kind = 'delivery';
+alter table amine.temperature_logs enable row level security;
+
+-- Limites réglementaires utilisées partout (frais : 0 à 5 °C ; surgelé : -18 °C ou moins).
+create or replace function amine.temp_ok(p_class text, p_temp numeric) returns boolean
+language sql immutable set search_path = '' as $$
+  select case p_class when 'chilled' then p_temp between 0 and 5 when 'frozen' then p_temp <= -18 else true end
+$$;
+
+-- Texte d'un nombre saisi (virgule ou point) → numérique à une décimale.
+create or replace function amine.temp_in(p_value text) returns numeric
+language plpgsql immutable set search_path = '' as $$
+declare
+  v text := replace(btrim(coalesce(p_value, '')), ',', '.');
+begin
+  if v !~ '^-?[0-9]{1,3}([.][0-9]{1,2})?$' then
+    perform amine.err('INVALID_INPUT', 'temperature');
+  end if;
+  if v::numeric < -60 or v::numeric > 100 then
+    perform amine.err('INVALID_INPUT', 'temperature');
+  end if;
+  return round(v::numeric, 1);
+end $$;
+
+-- ── Fiche produit : allergènes visibles par tous les clients ────────────────────────────────
+create or replace function amine.product_json(p amine.products) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object(
+    'id', p.id, 'section_id', p.section_id, 'sku', p.sku,
+    'name', p.name, 'name_ar', p.name_ar, 'name_en', p.name_en,
+    'description', p.description, 'description_ar', p.description_ar, 'description_en', p.description_en,
+    'price', p.price, 'unit', p.unit, 'image_url', p.image_url, 'image_credit', p.image_credit, 'ref', p.ref, 'sort', p.sort,
+    'brand', p.brand, 'barcode', p.barcode, 'vat_rate', p.vat_rate, 'price_tiers', p.price_tiers,
+    'allergens', to_jsonb(p.allergens), 'allergens_known', p.allergens_reviewed_at is not null,
+    'temp_class', p.temp_class,
+    'available', p.is_available and (p.stock is null or p.stock > 0))
+$$;
+
+-- ── Stock : les lots en quarantaine ne sont plus servis ─────────────────────────────────────
+-- (remplace la version de 08_business.sql ; seuls changent la condition « quarantine » et le tri des lots)
+create or replace function amine.on_stock_change() returns trigger
+language plpgsql set search_path = '' as $$
+declare
+  v_kind text;
+  v_ref text;
+  v_delta int;
+  v_mid bigint;
+  v_left int;
+  v_take int;
+  l record;
+begin
+  if new.stock is null or (tg_op = 'UPDATE' and new.stock is not distinct from old.stock) then
+    return new;
+  end if;
+  v_kind := case when tg_op = 'INSERT' then 'count'
+    else coalesce(nullif(current_setting('amine.stock_kind', true), ''), 'adjustment') end;
+  v_ref := nullif(current_setting('amine.stock_ref', true), '');
+  v_delta := new.stock - case when tg_op = 'INSERT' then 0 else coalesce(old.stock, 0) end;
+  insert into amine.stock_movements (store_id, product_id, kind, quantity, stock_after, ref, reason, created_by)
+  values (new.store_id, new.id, v_kind, v_delta, new.stock, v_ref,
+    nullif(current_setting('amine.stock_reason', true), ''), auth.uid())
+  returning id into v_mid;
+  if v_delta < 0 and v_kind not in ('purchase_cancel', 'quarantine') then
+    v_left := -v_delta;
+    for l in
+      select pl.id, pl.remaining from amine.purchase_lines pl join amine.purchases pu on pu.id = pl.purchase_id
+      where pl.product_id = new.id and pl.remaining > 0 and pu.status = 'received'
+        and pl.quarantined_at is null and pl.disposed_at is null
+      order by pl.expiry_on nulls last, pu.received_on, pl.id
+      for update of pl
+    loop
+      exit when v_left <= 0;
+      v_take := least(v_left, l.remaining);
+      update amine.purchase_lines set remaining = remaining - v_take where id = l.id;
+      insert into amine.stock_lot_moves (movement_id, purchase_line_id, quantity) values (v_mid, l.id, -v_take);
+      v_left := v_left - v_take;
+    end loop;
+  elsif v_delta > 0 and v_kind = 'return' and v_ref is not null then
+    v_left := v_delta;
+    for l in
+      select lm.purchase_line_id, -sum(lm.quantity)::int as qty
+      from amine.stock_lot_moves lm join amine.stock_movements m on m.id = lm.movement_id
+      where m.product_id = new.id and m.kind in ('sale', 'return') and m.ref = v_ref
+      group by lm.purchase_line_id having -sum(lm.quantity) > 0
+    loop
+      exit when v_left <= 0;
+      v_take := least(v_left, l.qty);
+      update amine.purchase_lines set remaining = least(quantity, remaining + v_take) where id = l.purchase_line_id;
+      insert into amine.stock_lot_moves (movement_id, purchase_line_id, quantity) values (v_mid, l.purchase_line_id, v_take);
+      v_left := v_left - v_take;
+    end loop;
+  end if;
+  return new;
+end $$;
+
+-- Une réception dont un lot est en quarantaine ne peut pas être annulée (le stock a déjà été retiré).
+create or replace function amine.purchase_hold_guard() returns trigger
+language plpgsql set search_path = '' as $$
+begin
+  if new.status = 'cancelled' and old.status is distinct from 'cancelled'
+     and exists (select 1 from amine.purchase_lines l where l.purchase_id = new.id
+                 and l.quarantined_at is not null and l.disposed_at is null) then
+    perform amine.err('LOT_ON_HOLD');
+  end if;
+  return new;
+end $$;
+drop trigger if exists amine_purchases_hold on amine.purchases;
+create trigger amine_purchases_hold before update of status on amine.purchases
+  for each row execute function amine.purchase_hold_guard();
+
+-- ── Lots : fiches et commandes concernées ────────────────────────────────────────────────────
+-- Commandes (non annulées) servies avec un lot : quantité nette sortie de ce lot (ventes − retours).
+create or replace function amine.lot_orders(p_line uuid) returns table (
+  order_id uuid, code text, status text, customer_id uuid, quantity int, placed_at timestamptz,
+  delivered_at timestamptz, business text, phone text)
+language sql stable set search_path = '' as $$
+  select o.id, o.code, o.status, o.customer_id, x.qty, o.placed_at, o.delivered_at, o.dropoff_name,
+    coalesce(o.dropoff_phone, pr.phone)
+  from (select m.ref, -sum(lm.quantity)::int as qty
+        from amine.stock_lot_moves lm join amine.stock_movements m on m.id = lm.movement_id
+        where lm.purchase_line_id = p_line and m.kind in ('sale', 'return') and m.ref is not null
+        group by m.ref having -sum(lm.quantity) > 0) x
+  join amine.orders o on o.code = x.ref
+  left join amine.profiles pr on pr.id = o.customer_id
+  where o.status not in ('cancelled', 'rejected')
+$$;
+
+create or replace function amine.lot_impact_json(p_line uuid) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object(
+    'orders', count(*),
+    'customers', count(distinct x.customer_id),
+    'quantity', coalesce(sum(x.quantity), 0),
+    'delivered', count(*) filter (where x.status = 'delivered'),
+    'open', count(*) filter (where x.status <> 'delivered'),
+    'list', coalesce(jsonb_agg(jsonb_build_object('code', x.code, 'status', x.status, 'quantity', x.quantity,
+      'placed_at', x.placed_at, 'delivered_at', x.delivered_at, 'business', x.business, 'phone', x.phone)
+      order by x.placed_at desc), '[]'::jsonb))
+  from amine.lot_orders(p_line) x
+$$;
+
+create or replace function amine.lot_json(l amine.purchase_lines, pu amine.purchases) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object(
+    'id', l.id, 'purchase_id', pu.id, 'purchase_ref', pu.reference, 'product_id', l.product_id,
+    'name', l.name, 'unit', l.unit,
+    'name_ar', (select p.name_ar from amine.products p where p.id = l.product_id),
+    'name_en', (select p.name_en from amine.products p where p.id = l.product_id),
+    'temp_class', (select p.temp_class from amine.products p where p.id = l.product_id),
+    'lot', l.lot, 'expiry_on', l.expiry_on, 'received_on', pu.received_on, 'quantity', l.quantity,
+    'remaining', l.remaining, 'quarantined_qty', l.quarantined_qty,
+    'supplier', (select su.name from amine.suppliers su where su.id = pu.supplier_id),
+    'state', case when l.disposed_at is not null then 'disposed' when l.quarantined_at is not null then 'quarantined' else 'active' end,
+    'reason', l.quarantine_reason, 'quarantined_at', l.quarantined_at, 'disposed_at', l.disposed_at,
+    'recall', (select jsonb_build_object('id', r.id, 'created_at', r.created_at, 'orders', r.orders_count,
+                 'customers', r.customers_count) from amine.lot_recalls r where r.id = l.recall_id))
+$$;
+
+-- Retire du stock vendable la quantité restante d'un lot (utilisé par la quarantaine et le rappel).
+create or replace function amine.hold_lot(p_line uuid, p_reason text) returns amine.purchase_lines
+language plpgsql set search_path = '' as $$
+declare
+  l amine.purchase_lines;
+  pr amine.products;
+  v_qty int := 0;
+  v_ref text;
+begin
+  select * into l from amine.purchase_lines where id = p_line for update;
+  if l.quarantined_at is not null or l.disposed_at is not null then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  select * into pr from amine.products where id = l.product_id for update;
+  if found and pr.stock is not null then
+    v_qty := least(l.remaining, pr.stock);
+    if v_qty > 0 then
+      v_ref := coalesce(l.lot, 'lot');
+      perform amine.stock_context('quarantine', v_ref, left(p_reason, 80));
+      update amine.products set stock = stock - v_qty, updated_at = now() where id = pr.id;
+      perform amine.stock_context(null, null, null);
+    end if;
+  end if;
+  update amine.purchase_lines set quarantined_at = now(), quarantine_reason = p_reason, quarantined_qty = v_qty
+  where id = l.id returning * into l;
+  return l;
+end $$;
+
+-- ── Lots : liste, quarantaine, remise en vente, destruction ──────────────────────────────────
+-- p_state : active | quarantined | disposed | all
+create or replace function public.merchant_lots(p_store_id uuid, p_search text default null, p_state text default 'all',
+  p_limit int default 150) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  v_search text := nullif(btrim(coalesce(p_search, '')), '');
+begin
+  if p_state is null or p_state not in ('active', 'quarantined', 'disposed', 'all') then
+    perform amine.err('INVALID_INPUT', 'state');
+  end if;
+  if v_search is not null and char_length(v_search) > 60 then
+    perform amine.err('INVALID_INPUT', 'search');
+  end if;
+  return jsonb_build_object(
+    'lots', coalesce((
+      select jsonb_agg(amine.lot_json(l, pu) order by pu.received_on desc, l.expiry_on nulls last, l.name)
+      from amine.purchase_lines l join amine.purchases pu on pu.id = l.purchase_id
+      where l.id in (
+        select l2.id from amine.purchase_lines l2 join amine.purchases pu2 on pu2.id = l2.purchase_id
+        where pu2.store_id = s.id and pu2.status = 'received' and pu2.received_on >= current_date - 400
+          and (p_state = 'all'
+            or (p_state = 'quarantined' and l2.quarantined_at is not null and l2.disposed_at is null)
+            or (p_state = 'disposed' and l2.disposed_at is not null)
+            or (p_state = 'active' and l2.quarantined_at is null and l2.disposed_at is null))
+          and (v_search is null or l2.name ilike '%' || replace(replace(v_search, '%', ''), '_', '') || '%'
+               or l2.lot ilike '%' || replace(replace(v_search, '%', ''), '_', '') || '%')
+        order by pu2.received_on desc, l2.id limit least(greatest(coalesce(p_limit, 150), 1), 400))), '[]'::jsonb));
+end $$;
+
+-- Aperçu d'un rappel : combien de commandes et de clients ont reçu ce lot.
+create or replace function public.merchant_lot_impact(p_store_id uuid, p_line_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  l amine.purchase_lines;
+  pu amine.purchases;
+begin
+  select l2.* into l from amine.purchase_lines l2 join amine.purchases p2 on p2.id = l2.purchase_id
+  where l2.id = p_line_id and p2.store_id = s.id;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  select * into pu from amine.purchases where id = l.purchase_id;
+  return jsonb_build_object('lot', amine.lot_json(l, pu), 'impact', amine.lot_impact_json(l.id));
+end $$;
+
+create or replace function public.merchant_quarantine_lot(p_store_id uuid, p_line_id uuid, p_reason text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  l amine.purchase_lines;
+  pu amine.purchases;
+  v_reason text;
+begin
+  perform amine.hit('lots:' || auth.uid(), 120, 3600);
+  v_reason := amine.txt(p_reason, 'reason', 200, true, 3);
+  select l2.* into l from amine.purchase_lines l2 join amine.purchases p2 on p2.id = l2.purchase_id
+  where l2.id = p_line_id and p2.store_id = s.id and p2.status = 'received' for update of l2;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  l := amine.hold_lot(l.id, v_reason);
+  select * into pu from amine.purchases where id = l.purchase_id;
+  perform amine.audit('lot.quarantined', 'store', s.id::text,
+    jsonb_build_object('line_id', l.id, 'lot', l.lot, 'product', l.name, 'quantity', l.quarantined_qty, 'reason', v_reason));
+  return amine.lot_json(l, pu);
+end $$;
+
+create or replace function public.merchant_release_lot(p_store_id uuid, p_line_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  l amine.purchase_lines;
+  pu amine.purchases;
+begin
+  perform amine.hit('lots:' || auth.uid(), 120, 3600);
+  select l2.* into l from amine.purchase_lines l2 join amine.purchases p2 on p2.id = l2.purchase_id
+  where l2.id = p_line_id and p2.store_id = s.id and p2.status = 'received' for update of l2;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if l.quarantined_at is null or l.disposed_at is not null then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  if l.recall_id is not null then
+    perform amine.err('LOT_RECALLED');
+  end if;
+  if l.quarantined_qty > 0 then
+    perform amine.stock_context('release', coalesce(l.lot, 'lot'), null);
+    update amine.products set stock = least(1000000, coalesce(stock, 0) + l.quarantined_qty), updated_at = now()
+    where id = l.product_id and stock is not null;
+    perform amine.stock_context(null, null, null);
+  end if;
+  update amine.purchase_lines set quarantined_at = null, quarantine_reason = null, quarantined_qty = 0
+  where id = l.id returning * into l;
+  select * into pu from amine.purchases where id = l.purchase_id;
+  perform amine.audit('lot.released', 'store', s.id::text, jsonb_build_object('line_id', l.id, 'lot', l.lot, 'product', l.name));
+  return amine.lot_json(l, pu);
+end $$;
+
+create or replace function public.merchant_dispose_lot(p_store_id uuid, p_line_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  l amine.purchase_lines;
+  pu amine.purchases;
+begin
+  perform amine.hit('lots:' || auth.uid(), 120, 3600);
+  select l2.* into l from amine.purchase_lines l2 join amine.purchases p2 on p2.id = l2.purchase_id
+  where l2.id = p_line_id and p2.store_id = s.id and p2.status = 'received' for update of l2;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if l.quarantined_at is null or l.disposed_at is not null then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  update amine.purchase_lines set disposed_at = now(), remaining = 0 where id = l.id returning * into l;
+  select * into pu from amine.purchases where id = l.purchase_id;
+  perform amine.audit('lot.disposed', 'store', s.id::text,
+    jsonb_build_object('line_id', l.id, 'lot', l.lot, 'product', l.name, 'quantity', l.quarantined_qty));
+  return amine.lot_json(l, pu);
+end $$;
+
+-- Rappel d'un lot en un clic : quarantaine, puis message à chaque client ayant reçu ce lot (commande
+-- livrée) et alerte du dépôt et de l'administration pour les commandes pas encore livrées.
+create or replace function public.merchant_recall_lot(p_store_id uuid, p_line_id uuid, p_reason text,
+  p_dispose boolean default false) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  l amine.purchase_lines;
+  pu amine.purchases;
+  r amine.lot_recalls;
+  x record;
+  v_reason text;
+  v_impact jsonb;
+  v_params jsonb;
+  v_label text;
+begin
+  perform amine.hit('lots:' || auth.uid(), 120, 3600);
+  v_reason := amine.txt(p_reason, 'reason', 200, true, 3);
+  select l2.* into l from amine.purchase_lines l2 join amine.purchases p2 on p2.id = l2.purchase_id
+  where l2.id = p_line_id and p2.store_id = s.id and p2.status = 'received' for update of l2;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if l.recall_id is not null or l.disposed_at is not null then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  if l.quarantined_at is null then
+    l := amine.hold_lot(l.id, v_reason);
+  else
+    update amine.purchase_lines set quarantine_reason = v_reason where id = l.id returning * into l;
+  end if;
+  v_impact := amine.lot_impact_json(l.id);
+  insert into amine.lot_recalls (store_id, purchase_line_id, product_id, product_name, lot, expiry_on, reason,
+    orders_count, customers_count, quantity, disposed, created_by)
+  values (s.id, l.id, l.product_id, l.name, l.lot, l.expiry_on, v_reason,
+    (v_impact ->> 'orders')::int, (v_impact ->> 'customers')::int, (v_impact ->> 'quantity')::int,
+    coalesce(p_dispose, false), auth.uid())
+  returning * into r;
+  update amine.purchase_lines set recall_id = r.id where id = l.id returning * into l;
+  if coalesce(p_dispose, false) then
+    update amine.purchase_lines set disposed_at = now(), remaining = 0 where id = l.id returning * into l;
+  end if;
+  select * into pu from amine.purchases where id = l.purchase_id;
+  v_label := coalesce(l.lot, to_char(pu.received_on, 'DD/MM/YYYY'));
+  for x in select * from amine.lot_orders(l.id) loop
+    v_params := jsonb_build_object('code', x.code, 'product', l.name, 'lot', v_label, 'reason', v_reason);
+    if x.status = 'delivered' then
+      perform amine.notify(x.customer_id, 'lot_recall', v_params, '#/orders/' || x.code);
+    else
+      perform amine.notify_store(s.id, 'lot_recall_open', v_params, '#/depot/orders/' || x.code || '?store=' || s.id::text);
+    end if;
+  end loop;
+  if (v_impact ->> 'open')::int > 0 then
+    perform amine.notify_admins('lot_recall_open',
+      jsonb_build_object('product', l.name, 'lot', v_label, 'reason', v_reason), '#/depot/hygiene?store=' || s.id::text);
+  end if;
+  perform amine.audit('lot.recalled', 'store', s.id::text,
+    jsonb_build_object('line_id', l.id, 'recall_id', r.id, 'lot', l.lot, 'product', l.name, 'reason', v_reason,
+      'orders', r.orders_count, 'customers', r.customers_count, 'disposed', coalesce(p_dispose, false)));
+  return jsonb_build_object('lot', amine.lot_json(l, pu), 'impact', v_impact);
+end $$;
+
+-- ── Allergènes et classe de température d'un produit ─────────────────────────────────────────
+-- p_data : {"allergens": ["gluten", …], "temp_class": "ambient|chilled|frozen"}. Enregistrer une liste
+-- (même vide) confirme que les allergènes ont été vérifiés.
+create or replace function public.merchant_set_food_safety(p_store_id uuid, p_product_id uuid, p_data jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  pr amine.products;
+  v_allergens text[];
+  v_class text;
+begin
+  perform amine.hit('catalog:' || auth.uid(), 600, 3600);
+  if p_data is null or jsonb_typeof(p_data) <> 'object' then
+    perform amine.err('INVALID_INPUT', 'data');
+  end if;
+  select * into pr from amine.products where id = p_product_id and store_id = s.id and deleted_at is null for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if p_data ? 'allergens' then
+    if jsonb_typeof(p_data -> 'allergens') <> 'array' or jsonb_array_length(p_data -> 'allergens') > 14 then
+      perform amine.err('INVALID_INPUT', 'allergens');
+    end if;
+    select coalesce(array_agg(distinct a order by a), '{}') into v_allergens from jsonb_array_elements_text(p_data -> 'allergens') a;
+    if not v_allergens <@ array['gluten', 'crustaceans', 'eggs', 'fish', 'peanuts', 'soy', 'milk', 'nuts', 'celery',
+         'mustard', 'sesame', 'sulphites', 'lupin', 'molluscs']::text[] then
+      perform amine.err('INVALID_INPUT', 'allergens');
+    end if;
+  else
+    v_allergens := pr.allergens;
+  end if;
+  v_class := coalesce(nullif(btrim(p_data ->> 'temp_class'), ''), pr.temp_class);
+  if v_class not in ('ambient', 'chilled', 'frozen') then
+    perform amine.err('INVALID_INPUT', 'temp_class');
+  end if;
+  update amine.products set allergens = v_allergens, temp_class = v_class,
+    allergens_reviewed_at = case when p_data ? 'allergens' then now() else allergens_reviewed_at end, updated_at = now()
+  where id = pr.id returning * into pr;
+  perform amine.audit('product.food_safety', 'product', pr.id::text,
+    jsonb_build_object('store_id', s.id, 'allergens', to_jsonb(pr.allergens), 'temp_class', pr.temp_class));
+  return amine.merchant_product_json(pr);
+end $$;
+
+-- ── Relevés de température ───────────────────────────────────────────────────────────────────
+create or replace function amine.temp_log_json(t amine.temperature_logs) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object('id', t.id, 'kind', t.kind, 'temp_class', t.temp_class, 'temperature', t.temperature,
+    'within_limits', t.within_limits, 'location', t.location, 'corrective', t.corrective, 'created_at', t.created_at,
+    'purchase_ref', (select coalesce(pu.reference, left(pu.id::text, 8)) from amine.purchases pu where pu.id = t.purchase_id),
+    'product', (select p.name from amine.products p where p.id = t.product_id),
+    'order_code', (select o.code from amine.orders o where o.id = t.order_id),
+    'by', (select x.full_name from amine.profiles x where x.id = t.created_by))
+$$;
+
+-- p_data : {"kind": "reception|storage", "temp_class": "chilled|frozen", "temperature": -19.5, "location",
+-- "purchase_id", "product_id", "corrective"}. Hors limites : l'action corrective est obligatoire.
+create or replace function public.merchant_log_temperature(p_store_id uuid, p_data jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  v_kind text;
+  v_class text;
+  v_temp numeric;
+  v_ok boolean;
+  v_corrective text;
+  v_purchase uuid;
+  v_product uuid;
+  t amine.temperature_logs;
+begin
+  perform amine.hit('temps:' || auth.uid(), 300, 3600);
+  if p_data is null or jsonb_typeof(p_data) <> 'object' then
+    perform amine.err('INVALID_INPUT', 'data');
+  end if;
+  v_kind := p_data ->> 'kind';
+  if v_kind is null or v_kind not in ('reception', 'storage') then
+    perform amine.err('INVALID_INPUT', 'kind');
+  end if;
+  v_class := p_data ->> 'temp_class';
+  if v_class is null or v_class not in ('chilled', 'frozen') then
+    perform amine.err('INVALID_INPUT', 'temp_class');
+  end if;
+  v_temp := amine.temp_in(p_data ->> 'temperature');
+  v_ok := amine.temp_ok(v_class, v_temp);
+  v_corrective := amine.txt(p_data ->> 'corrective', 'corrective', 200, false, 3);
+  if not v_ok and v_corrective is null then
+    perform amine.err('TEMP_ACTION_REQUIRED');
+  end if;
+  v_purchase := amine.uuid_in(p_data, 'purchase_id');
+  if v_purchase is not null and not exists (select 1 from amine.purchases where id = v_purchase and store_id = s.id) then
+    perform amine.err('INVALID_INPUT', 'purchase_id');
+  end if;
+  v_product := amine.uuid_in(p_data, 'product_id');
+  if v_product is not null and not exists (select 1 from amine.products where id = v_product and store_id = s.id) then
+    perform amine.err('INVALID_INPUT', 'product_id');
+  end if;
+  insert into amine.temperature_logs (store_id, kind, temp_class, temperature, within_limits, location, purchase_id,
+    product_id, corrective, created_by)
+  values (s.id, v_kind, v_class, v_temp, v_ok, amine.txt(p_data ->> 'location', 'location', 60), v_purchase, v_product,
+    case when v_ok then null else v_corrective end, auth.uid())
+  returning * into t;
+  if not v_ok then
+    perform amine.notify_admins('temp_alert', jsonb_build_object('store', s.name, 'where', v_kind,
+      'temperature', v_temp, 'class', v_class), '#/depot/hygiene?store=' || s.id::text);
+  end if;
+  return amine.temp_log_json(t);
+end $$;
+
+-- Tableau de bord hygiène d'un dépôt : relevés récents, lots en quarantaine, rappels, produits à vérifier.
+create or replace function public.merchant_haccp(p_store_id uuid, p_days int default 14) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  v_days int := least(greatest(coalesce(p_days, 14), 1), 180);
+  v_since timestamptz;
+begin
+  v_since := now() - make_interval(days => v_days);
+  return jsonb_build_object(
+    'limits', jsonb_build_object('chilled', jsonb_build_object('min', 0, 'max', 5),
+      'frozen', jsonb_build_object('max', -18)),
+    'summary', jsonb_build_object(
+      'readings', (select count(*) from amine.temperature_logs t where t.store_id = s.id and t.created_at >= v_since),
+      'out_of_limits', (select count(*) from amine.temperature_logs t
+                        where t.store_id = s.id and t.created_at >= v_since and not t.within_limits),
+      'last_reading', (select max(t.created_at) from amine.temperature_logs t where t.store_id = s.id),
+      'quarantined', (select count(*) from amine.purchase_lines l join amine.purchases pu on pu.id = l.purchase_id
+                      where pu.store_id = s.id and l.quarantined_at is not null and l.disposed_at is null),
+      'unreviewed', (select count(*) from amine.products p
+                     where p.store_id = s.id and p.deleted_at is null and p.allergens_reviewed_at is null),
+      'products', (select count(*) from amine.products p where p.store_id = s.id and p.deleted_at is null)),
+    'logs', coalesce((
+      select jsonb_agg(amine.temp_log_json(t) order by t.created_at desc)
+      from (select * from amine.temperature_logs where store_id = s.id and created_at >= v_since
+            order by created_at desc limit 200) t), '[]'::jsonb),
+    'recalls', coalesce((
+      select jsonb_agg(jsonb_build_object('id', r.id, 'product', r.product_name, 'lot', r.lot, 'expiry_on', r.expiry_on,
+          'reason', r.reason, 'orders', r.orders_count, 'customers', r.customers_count, 'quantity', r.quantity,
+          'disposed', r.disposed, 'created_at', r.created_at) order by r.created_at desc)
+      from (select * from amine.lot_recalls where store_id = s.id order by created_at desc limit 20) r), '[]'::jsonb));
+end $$;
+
+-- ── Livraison : le livreur relève la température des produits frais ou surgelés ──────────────
+-- Classe de la commande : surgelé si un article l'est, sinon frais si un article l'est, sinon rien.
+create or replace function amine.cold_chain(p_order uuid) returns text
+language sql stable set search_path = '' as $$
+  select case when bool_or(p.temp_class = 'frozen') then 'frozen' when bool_or(p.temp_class = 'chilled') then 'chilled' end
+  from amine.order_items i join amine.products p on p.id = i.product_id where i.order_id = p_order
+$$;
+
+create or replace function amine.cold_json(o amine.orders) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object('cold_chain', amine.cold_chain(o.id),
+    'delivery_temp', (select jsonb_build_object('temperature', t.temperature, 'within_limits', t.within_limits,
+        'corrective', t.corrective, 'at', t.created_at)
+      from amine.temperature_logs t where t.order_id = o.id and t.kind = 'delivery'))
+$$;
+
+create or replace function public.courier_log_temperature(p_code text, p_temperature text, p_corrective text default null) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  c amine.couriers := amine.require_courier();
+  o amine.orders;
+  v_class text;
+  v_temp numeric;
+  v_ok boolean;
+  v_corrective text;
+  t amine.temperature_logs;
+begin
+  perform amine.hit('courier_action:' || c.user_id, 120, 600);
+  select * into o from amine.orders where code = upper(btrim(coalesce(p_code, ''))) and courier_id = c.user_id for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if o.status not in ('picked_up', 'delivered') or (o.status = 'delivered' and o.delivered_at < now() - interval '6 hours') then
+    perform amine.err('INVALID_TRANSITION');
+  end if;
+  v_class := amine.cold_chain(o.id);
+  if v_class is null then
+    perform amine.err('NO_COLD_CHAIN');
+  end if;
+  v_temp := amine.temp_in(p_temperature);
+  v_ok := amine.temp_ok(v_class, v_temp);
+  v_corrective := amine.txt(p_corrective, 'corrective', 200, false, 3);
+  if not v_ok and v_corrective is null then
+    perform amine.err('TEMP_ACTION_REQUIRED');
+  end if;
+  delete from amine.temperature_logs where order_id = o.id and kind = 'delivery';
+  insert into amine.temperature_logs (store_id, kind, temp_class, temperature, within_limits, order_id, corrective, created_by)
+  values (o.store_id, 'delivery', v_class, v_temp, v_ok, o.id, case when v_ok then null else v_corrective end, c.user_id)
+  returning * into t;
+  if not v_ok then
+    perform amine.notify_admins('temp_alert', jsonb_build_object('store', o.pickup_name, 'where', 'delivery',
+      'temperature', v_temp, 'class', v_class, 'code', o.code), '#/depot/hygiene?store=' || o.store_id::text);
+    perform amine.notify_store(o.store_id, 'temp_alert', jsonb_build_object('store', o.pickup_name, 'where', 'delivery',
+      'temperature', v_temp, 'class', v_class, 'code', o.code), '#/depot/hygiene?store=' || o.store_id::text);
+  end if;
+  return amine.temp_log_json(t) || jsonb_build_object('cold_chain', v_class);
+end $$;
+
+-- Tournée du livreur : chaque commande indique si elle est à maintenir au frais et sa température relevée
+-- (remplace les versions de 06_courier.sql).
+create or replace function public.courier_jobs() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  c amine.couriers := amine.require_courier();
+begin
+  perform amine.maintenance();
+  return jsonb_build_object(
+    'online', c.is_online,
+    'max_active_jobs', greatest(1, coalesce((amine.setting('couriers') ->> 'max_active_jobs')::int, 2)),
+    'available', case when not c.is_online then '[]'::jsonb else coalesce((
+      select jsonb_agg(amine.order_json(x, 'courier_preview') order by x.ready_at nulls last, x.placed_at)
+      from (select * from amine.orders o
+            where o.courier_id is null and o.status in ('accepted', 'preparing', 'ready')
+              and (c.zone_id is null or o.zone_id = c.zone_id) and amine.job_open(o)
+            order by coalesce(amine.slot_start(o.deliver_on, o.delivery_slot), o.placed_at), o.placed_at
+            limit 50) x), '[]'::jsonb) end,
+    'mine', coalesce((
+      select jsonb_agg(amine.order_json(o, 'courier') || amine.cold_json(o) order by o.route_seq nulls last, o.assigned_at)
+      from amine.orders o
+      where o.courier_id = c.user_id and o.status in ('accepted', 'preparing', 'ready', 'picked_up')), '[]'::jsonb));
+end $$;
+
+create or replace function public.courier_job(p_code text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  c amine.couriers := amine.require_courier();
+  o amine.orders;
+begin
+  select * into o from amine.orders where code = upper(btrim(coalesce(p_code, ''))) and courier_id = c.user_id;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  return amine.order_json(o, 'courier') || amine.cold_json(o);
+end $$;
+
+-- ── Droits ────────────────────────────────────────────────────────────────────────────────────
+revoke all on function amine.temp_ok(text, numeric) from public, anon, authenticated;
+revoke all on function amine.temp_in(text) from public, anon, authenticated;
+revoke all on function amine.purchase_hold_guard() from public, anon, authenticated;
+revoke all on function amine.lot_orders(uuid) from public, anon, authenticated;
+revoke all on function amine.lot_impact_json(uuid) from public, anon, authenticated;
+revoke all on function amine.lot_json(amine.purchase_lines, amine.purchases) from public, anon, authenticated;
+revoke all on function amine.hold_lot(uuid, text) from public, anon, authenticated;
+revoke all on function amine.temp_log_json(amine.temperature_logs) from public, anon, authenticated;
+revoke all on function amine.cold_chain(uuid) from public, anon, authenticated;
+revoke all on function amine.cold_json(amine.orders) from public, anon, authenticated;
+revoke all on function amine.product_json(amine.products) from public, anon, authenticated;
+revoke all on function amine.on_stock_change() from public, anon, authenticated;
+revoke all on function public.merchant_lots(uuid, text, text, int) from public, anon, authenticated;
+revoke all on function public.merchant_lot_impact(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.merchant_quarantine_lot(uuid, uuid, text) from public, anon, authenticated;
+revoke all on function public.merchant_release_lot(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.merchant_dispose_lot(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.merchant_recall_lot(uuid, uuid, text, boolean) from public, anon, authenticated;
+revoke all on function public.merchant_set_food_safety(uuid, uuid, jsonb) from public, anon, authenticated;
+revoke all on function public.merchant_log_temperature(uuid, jsonb) from public, anon, authenticated;
+revoke all on function public.merchant_haccp(uuid, int) from public, anon, authenticated;
+revoke all on function public.courier_log_temperature(text, text, text) from public, anon, authenticated;
+revoke all on function public.courier_jobs() from public, anon, authenticated;
+revoke all on function public.courier_job(text) from public, anon, authenticated;
+grant execute on function public.merchant_lots(uuid, text, text, int) to authenticated;
+grant execute on function public.merchant_lot_impact(uuid, uuid) to authenticated;
+grant execute on function public.merchant_quarantine_lot(uuid, uuid, text) to authenticated;
+grant execute on function public.merchant_release_lot(uuid, uuid) to authenticated;
+grant execute on function public.merchant_dispose_lot(uuid, uuid) to authenticated;
+grant execute on function public.merchant_recall_lot(uuid, uuid, text, boolean) to authenticated;
+grant execute on function public.merchant_set_food_safety(uuid, uuid, jsonb) to authenticated;
+grant execute on function public.merchant_log_temperature(uuid, jsonb) to authenticated;
+grant execute on function public.merchant_haccp(uuid, int) to authenticated;
+grant execute on function public.courier_log_temperature(text, text, text) to authenticated;
+grant execute on function public.courier_jobs() to authenticated;
+grant execute on function public.courier_job(text) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- =============================================================================================
+--  Fidélité, parrainage, offre de bienvenue, ventes flash, relance des clients inactifs (version 8)
+--
+--  • Points : 1 point par dinar de marchandises livrées (réglable), crédités à la livraison, rendus si la
+--    commande est annulée ou refusée, repris au prorata d'un avoir. Utilisables à la commande (valeur d'un
+--    point et plafond réglables) : la remise est financée par AMINE, comme un code promo.
+--  • Parrainage : chaque client a un code ; le filleul le saisit avant sa première commande ; les deux
+--    reçoivent des points quand sa première commande livrée atteint le minimum fixé (contrôles anti-abus :
+--    même téléphone ou même établissement refusés, nombre de filleuls limité).
+--  • Offre de bienvenue : un code promo « appliqué automatiquement » (première commande seulement).
+--  • Ventes flash : prix réduit sur un produit, pendant une durée et pour une quantité limitées ; le prix est
+--    appliqué par le serveur (jamais par le navigateur) et le compte à rebours part de l'heure du serveur.
+--  • Relance : un restaurant qui n'a pas commandé depuis N jours (15 par défaut) reçoit un rappel dans
+--    l'application, une seule fois par période d'inactivité, et seulement s'il a accepté les messages.
+--
+--  Ce script complète les fichiers précédents (les fonctions de commande y font appel) ; il peut être
+--  rejoué sans risque.
+-- =============================================================================================
+
+-- ── Tables et colonnes ───────────────────────────────────────────────────────────────────────
+alter table amine.promotions add column if not exists auto_apply boolean not null default false;
+
+alter table amine.orders add column if not exists loyalty_points int not null default 0;
+alter table amine.orders add column if not exists loyalty_discount int not null default 0;
+alter table amine.orders drop constraint if exists orders_loyalty_check;
+alter table amine.orders add constraint orders_loyalty_check
+  check (loyalty_points >= 0 and loyalty_discount >= 0 and loyalty_discount <= discount);
+
+alter table amine.profiles add column if not exists referral_code text;
+alter table amine.profiles add column if not exists reminded_at timestamptz;
+alter table amine.profiles drop constraint if exists profiles_referral_code_check;
+alter table amine.profiles add constraint profiles_referral_code_check
+  check (referral_code is null or referral_code ~ '^AMI-[2-9A-HJ-NP-Z]{6}$');
+create unique index if not exists profiles_referral_code_idx on amine.profiles (referral_code) where referral_code is not null;
+
+create table if not exists amine.loyalty_ledger (
+  id bigint generated always as identity primary key,
+  customer_id uuid not null references amine.profiles (id) on delete cascade,
+  delta int not null check (delta <> 0 and delta between -100000000 and 100000000),
+  kind text not null check (kind in ('earn', 'redeem', 'refund', 'edit_refund', 'reversal', 'referral', 'adjust')),
+  order_id uuid references amine.orders (id) on delete set null,
+  ref text check (ref is null or char_length(ref) <= 80),
+  note text check (note is null or char_length(note) <= 200),
+  created_by uuid,
+  created_at timestamptz not null default now()
+);
+create index if not exists loyalty_ledger_customer_idx on amine.loyalty_ledger (customer_id, id desc);
+create index if not exists loyalty_ledger_order_idx on amine.loyalty_ledger (order_id) where order_id is not null;
+-- Une commande rapporte, utilise et rend ses points une seule fois ; une récompense de parrainage n'est versée qu'une fois.
+create unique index if not exists loyalty_once_idx on amine.loyalty_ledger (order_id, kind)
+  where order_id is not null and kind in ('earn', 'redeem', 'refund');
+create unique index if not exists loyalty_referral_idx on amine.loyalty_ledger (ref) where kind = 'referral';
+alter table amine.loyalty_ledger enable row level security;
+
+create table if not exists amine.referrals (
+  id uuid primary key default gen_random_uuid(),
+  referrer_id uuid not null references amine.profiles (id) on delete cascade,
+  referee_id uuid not null unique references amine.profiles (id) on delete cascade,
+  status text not null default 'pending' check (status in ('pending', 'rewarded', 'void')),
+  void_reason text check (void_reason is null or char_length(void_reason) <= 60),
+  points int check (points is null or points >= 0),
+  order_id uuid references amine.orders (id) on delete set null,
+  created_at timestamptz not null default now(),
+  rewarded_at timestamptz,
+  check (referrer_id <> referee_id)
+);
+create index if not exists referrals_referrer_idx on amine.referrals (referrer_id, created_at desc);
+alter table amine.referrals enable row level security;
+
+create table if not exists amine.flash_sales (
+  id uuid primary key default gen_random_uuid(),
+  store_id uuid not null references amine.stores (id) on delete cascade,
+  product_id uuid not null references amine.products (id) on delete cascade,
+  price int not null check (price between 1 and 100000000),
+  starts_at timestamptz not null,
+  ends_at timestamptz not null,
+  max_units int check (max_units is null or max_units between 1 and 1000000),
+  per_order_max int check (per_order_max is null or per_order_max between 1 and 999),
+  is_active boolean not null default true,
+  stopped_at timestamptz,
+  notified_at timestamptz,
+  created_by uuid,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  check (ends_at > starts_at and ends_at <= starts_at + interval '15 days')
+);
+create index if not exists flash_sales_product_idx on amine.flash_sales (product_id, starts_at desc);
+create index if not exists flash_sales_store_idx on amine.flash_sales (store_id, starts_at desc);
+alter table amine.flash_sales enable row level security;
+
+alter table amine.order_items add column if not exists flash_sale_id uuid references amine.flash_sales (id) on delete set null;
+create index if not exists order_items_flash_idx on amine.order_items (flash_sale_id) where flash_sale_id is not null;
+
+-- ── Points : écritures, solde, utilisation ───────────────────────────────────────────────────
+create or replace function amine.loyalty_add(
+  p_customer uuid, p_delta int, p_kind text, p_order uuid default null, p_ref text default null,
+  p_note text default null, p_by uuid default null
+) returns void
+language plpgsql set search_path = '' as $$
+begin
+  if p_customer is null or coalesce(p_delta, 0) = 0 then
+    return;
+  end if;
+  insert into amine.loyalty_ledger (customer_id, delta, kind, order_id, ref, note, created_by)
+  values (p_customer, p_delta, p_kind, p_order, left(p_ref, 80), left(p_note, 200), p_by)
+  on conflict do nothing;
+end $$;
+
+-- Points qu'un client peut utiliser sur une commande : {enabled, balance, point_value, min_redeem, points, discount}.
+-- p_subtotal : marchandises ; p_payable : ce qui reste à payer avant les points (le plafond s'applique aux marchandises).
+create or replace function amine.loyalty_redeem_calc(p_customer uuid, p_subtotal int, p_payable int) returns jsonb
+language plpgsql stable set search_path = '' as $$
+declare
+  cfg jsonb := amine.setting('loyalty');
+  v_balance int := greatest(0, amine.loyalty_balance(p_customer));
+  v_value int := greatest(1, (cfg ->> 'point_value')::int);
+  v_min int := greatest(1, (cfg ->> 'min_redeem')::int);
+  v_cap int;
+  v_points int := 0;
+begin
+  if coalesce((cfg ->> 'enabled')::boolean, false) then
+    v_cap := least(greatest(0, p_payable), floor(greatest(0, p_subtotal)::numeric * (cfg ->> 'max_redeem_bps')::int / 10000)::int);
+    v_points := least(v_balance, v_cap / v_value);
+    if v_points < v_min then
+      v_points := 0;
+    end if;
+  end if;
+  return jsonb_build_object('enabled', coalesce((cfg ->> 'enabled')::boolean, false), 'balance', v_balance,
+    'point_value', v_value, 'min_redeem', v_min, 'max_redeem_bps', (cfg ->> 'max_redeem_bps')::int,
+    'earn_per_dt', greatest(0, coalesce((cfg ->> 'earn_per_dt')::int, 0)),
+    'points', v_points, 'discount', v_points * v_value);
+end $$;
+
+-- Remise d'une commande modifiée (prix ou pesée) : code promo recalculé ; points conservés dans la limite de ce
+-- qui reste à payer (si la commande baisse trop, les points en trop sont rendus).
+create or replace function amine.reprice_discount(o amine.orders, p_sub int) returns jsonb
+language plpgsql stable set search_path = '' as $$
+declare
+  pr amine.promotions;
+  v_gross int := p_sub + o.delivery_fee + o.service_fee;
+  v_promo int;
+  v_loy int;
+  v_points int := o.loyalty_points;
+begin
+  if o.promo_code is not null then
+    select * into pr from amine.promotions where code = o.promo_code;
+  end if;
+  if pr.id is not null then
+    v_promo := amine.promo_discount(pr, p_sub, o.delivery_fee, o.service_fee);
+  else
+    v_promo := greatest(0, o.discount - o.loyalty_discount);
+  end if;
+  v_promo := least(v_promo, v_gross);
+  v_loy := least(o.loyalty_discount, greatest(0, v_gross - v_promo));
+  if v_loy < o.loyalty_discount then
+    v_points := case when o.loyalty_discount = 0 then 0
+      else ceil(o.loyalty_points::numeric * v_loy / o.loyalty_discount)::int end;
+  end if;
+  return jsonb_build_object('discount', v_promo + v_loy, 'promo_discount', v_promo, 'loyalty_discount', v_loy,
+    'loyalty_points', v_points, 'refund_points', o.loyalty_points - v_points);
+end $$;
+
+-- Points gagnés sur une commande : retirés au prorata d'un avoir (marchandise reprise).
+create or replace function amine.loyalty_reverse(p_order uuid, p_amount int, p_ref text) returns void
+language plpgsql set search_path = '' as $$
+declare
+  o amine.orders;
+  v_rate int := greatest(0, (amine.setting('loyalty') ->> 'earn_per_dt')::int);
+  v_earned int;
+  v_reversed int;
+  v_pts int;
+begin
+  if p_order is null then
+    return;
+  end if;
+  select * into o from amine.orders where id = p_order;
+  if not found or o.customer_id is null then
+    return;
+  end if;
+  select coalesce(sum(l.delta) filter (where l.kind = 'earn'), 0), coalesce(-sum(l.delta) filter (where l.kind = 'reversal'), 0)
+  into v_earned, v_reversed from amine.loyalty_ledger l where l.order_id = o.id;
+  v_pts := least(v_earned - v_reversed, floor(greatest(0, p_amount)::numeric / 1000 * v_rate)::int);
+  if v_pts > 0 then
+    perform amine.loyalty_add(o.customer_id, -v_pts, 'reversal', o.id, p_ref, 'credit_note');
+  end if;
+end $$;
+
+-- ── Parrainage ───────────────────────────────────────────────────────────────────────────────
+create or replace function amine.referral_code_for(p_customer uuid) returns text
+language plpgsql set search_path = '' as $$
+declare
+  alphabet constant text := '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  v text;
+  i int;
+  n int := 0;
+begin
+  select referral_code into v from amine.profiles where id = p_customer;
+  if v is not null then
+    return v;
+  end if;
+  loop
+    v := 'AMI-';
+    for i in 1..6 loop
+      v := v || substr(alphabet, 1 + floor(random() * 32)::int, 1);
+    end loop;
+    n := n + 1;
+    exit when not exists (select 1 from amine.profiles where referral_code = v) or n > 20;
+  end loop;
+  update amine.profiles set referral_code = v where id = p_customer and referral_code is null;
+  select referral_code into v from amine.profiles where id = p_customer;
+  return v;
+end $$;
+
+-- Rattache un filleul à son parrain (avant sa première commande). Erreurs : REFERRAL_DISABLED, REFERRAL_INVALID,
+-- REFERRAL_SELF, REFERRAL_ALREADY, REFERRAL_TOO_LATE, REFERRAL_LIMIT.
+create or replace function amine.link_referral(p_user uuid, p_code text) returns void
+language plpgsql set search_path = '' as $$
+declare
+  cfg jsonb := amine.setting('loyalty');
+  v_raw text := upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g'));
+  v_code text;
+  er amine.profiles;
+begin
+  if not coalesce((cfg ->> 'enabled')::boolean, false) or not coalesce((cfg ->> 'referral_enabled')::boolean, false) then
+    perform amine.err('REFERRAL_DISABLED');
+  end if;
+  v_code := case when v_raw ~ '^AMI[2-9A-HJ-NP-Z]{6}$' then 'AMI-' || substr(v_raw, 4) end;
+  if v_code is null then
+    perform amine.err('REFERRAL_INVALID');
+  end if;
+  select * into er from amine.profiles where referral_code = v_code and status = 'active';
+  if not found then
+    perform amine.err('REFERRAL_INVALID');
+  end if;
+  if er.id = p_user then
+    perform amine.err('REFERRAL_SELF');
+  end if;
+  if exists (select 1 from amine.referrals where referee_id = p_user) then
+    perform amine.err('REFERRAL_ALREADY');
+  end if;
+  if exists (select 1 from amine.orders o where o.customer_id = p_user and o.kind = 'store'
+             and o.status not in ('cancelled', 'rejected')) then
+    perform amine.err('REFERRAL_TOO_LATE');
+  end if;
+  if (select count(*) from amine.referrals r where r.referrer_id = er.id and r.status <> 'void')
+     >= greatest(1, (cfg ->> 'referral_max')::int) then
+    perform amine.err('REFERRAL_LIMIT');
+  end if;
+  insert into amine.referrals (referrer_id, referee_id) values (er.id, p_user);
+end $$;
+
+-- ── À la livraison : points gagnés et récompense de parrainage ───────────────────────────────
+create or replace function amine.loyalty_on_delivered(o amine.orders) returns void
+language plpgsql set search_path = '' as $$
+declare
+  cfg jsonb := amine.setting('loyalty');
+  v_goods int := greatest(0, o.subtotal - o.discount);
+  v_pts int;
+  v_reward int := greatest(0, (cfg ->> 'referral_points')::int);
+  r amine.referrals;
+  ee amine.profiles;
+  er amine.profiles;
+  v_void text;
+begin
+  if not coalesce((cfg ->> 'enabled')::boolean, false) then
+    return;
+  end if;
+  v_pts := floor(v_goods::numeric / 1000 * greatest(0, (cfg ->> 'earn_per_dt')::int))::int;
+  if v_pts > 0 then
+    perform amine.loyalty_add(o.customer_id, v_pts, 'earn', o.id, o.code);
+    perform amine.notify(o.customer_id, 'points_earned', jsonb_build_object('points', v_pts, 'code', o.code,
+      'balance', amine.loyalty_balance(o.customer_id)), '#/account/rewards');
+  end if;
+
+  if not coalesce((cfg ->> 'referral_enabled')::boolean, false) then
+    return;
+  end if;
+  select * into r from amine.referrals where referee_id = o.customer_id and status = 'pending' for update;
+  if not found or v_goods < greatest(0, (cfg ->> 'referral_min_subtotal')::int) then
+    return;
+  end if;
+  select * into ee from amine.profiles where id = r.referee_id;
+  select * into er from amine.profiles where id = r.referrer_id;
+  v_void := case
+    when er.id is null or er.status <> 'active' then 'REFERRER_INACTIVE'
+    when ee.phone is not null and ee.phone = er.phone then 'SAME_PHONE'
+    when ee.tax_id is not null and er.tax_id is not null and lower(btrim(ee.tax_id)) = lower(btrim(er.tax_id)) then 'SAME_BUSINESS'
+    when ee.business_name is not null and er.business_name is not null
+      and lower(btrim(ee.business_name)) = lower(btrim(er.business_name)) then 'SAME_BUSINESS'
+    else null end;
+  if v_void is not null then
+    update amine.referrals set status = 'void', void_reason = v_void where id = r.id;
+    return;
+  end if;
+  if v_reward > 0 then
+    perform amine.loyalty_add(er.id, v_reward, 'referral', null, r.id::text || ':referrer');
+    perform amine.loyalty_add(ee.id, v_reward, 'referral', null, r.id::text || ':referee');
+    perform amine.notify(er.id, 'referral_rewarded', jsonb_build_object('points', v_reward, 'name', ee.business_name),
+      '#/account/rewards');
+    perform amine.notify(ee.id, 'referral_rewarded', jsonb_build_object('points', v_reward, 'name', er.business_name),
+      '#/account/rewards');
+  end if;
+  update amine.referrals set status = 'rewarded', points = v_reward, order_id = o.id, rewarded_at = now() where id = r.id;
+end $$;
+
+create or replace function amine.on_order_loyalty() returns trigger
+language plpgsql set search_path = '' as $$
+begin
+  if new.status is not distinct from old.status or new.kind <> 'store' or new.customer_id is null then
+    return new;
+  end if;
+  if new.status in ('cancelled', 'rejected') then
+    -- Commande annulée ou refusée : les points utilisés sont rendus.
+    if new.loyalty_points > 0 then
+      perform amine.loyalty_add(new.customer_id, new.loyalty_points, 'refund', new.id, new.code);
+    end if;
+  elsif new.status = 'delivered' then
+    perform amine.loyalty_on_delivered(new);
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists amine_orders_loyalty on amine.orders;
+create trigger amine_orders_loyalty
+  after update of status on amine.orders
+  for each row execute function amine.on_order_loyalty();
+
+-- ── Offre de bienvenue (code promo appliqué automatiquement à la première commande) ───────────
+create or replace function amine.auto_promo(
+  p_customer uuid, p_store amine.stores, p_subtotal int, p_fee int, p_service int, p_lock boolean
+) returns jsonb
+language plpgsql set search_path = '' as $$
+declare
+  r record;
+  v_try jsonb;
+  v_best jsonb;
+begin
+  if p_customer is null then
+    return null;
+  end if;
+  if exists (select 1 from amine.orders where customer_id = p_customer and status not in ('cancelled', 'rejected')) then
+    return null;
+  end if;
+  for r in select pr.code from amine.promotions pr
+           where pr.auto_apply and pr.is_active and pr.archived_at is null order by pr.created_at limit 5 loop
+    v_try := amine.promo_eval(r.code, p_customer, p_store, p_subtotal, p_fee, p_service, p_lock) || jsonb_build_object('auto', true);
+    if coalesce((v_try ->> 'ok')::boolean, false) then
+      if v_best is null or not coalesce((v_best ->> 'ok')::boolean, false)
+         or (v_try ->> 'discount')::int > (v_best ->> 'discount')::int then
+        v_best := v_try;
+      end if;
+    elsif v_best is null and v_try ->> 'error' = 'PROMO_MIN_SUBTOTAL' then
+      v_best := v_try;
+    end if;
+  end loop;
+  return v_best;
+end $$;
+
+-- ── Ventes flash ─────────────────────────────────────────────────────────────────────────────
+-- Unités vendues au prix flash (commandes non annulées ni refusées).
+create or replace function amine.flash_sold(p_id uuid) returns int
+language sql stable set search_path = '' as $$
+  select coalesce(sum(i.quantity), 0)::int
+  from amine.order_items i join amine.orders o on o.id = i.order_id
+  where i.flash_sale_id = p_id and o.status not in ('cancelled', 'rejected')
+$$;
+
+-- Vente flash en cours sur un produit, avec ce qu'elle donne pour cette quantité :
+-- {id, price, starts_at, ends_at, remaining, per_order_max, regular_price, applies}. null = aucune vente flash.
+create or replace function amine.flash_for(p_product uuid, p_unit int, p_qty int) returns jsonb
+language plpgsql stable set search_path = '' as $$
+declare
+  f amine.flash_sales;
+  v_remaining int;
+begin
+  select * into f from amine.flash_sales fs
+  where fs.product_id = p_product and fs.is_active and now() >= fs.starts_at and now() < fs.ends_at
+  order by fs.price limit 1;
+  if not found then
+    return null;
+  end if;
+  if f.max_units is not null then
+    v_remaining := greatest(0, f.max_units - amine.flash_sold(f.id));
+    if v_remaining = 0 then
+      return null;
+    end if;
+  end if;
+  return jsonb_build_object('id', f.id, 'price', f.price, 'starts_at', f.starts_at, 'ends_at', f.ends_at,
+    'remaining', v_remaining, 'per_order_max', f.per_order_max, 'regular_price', p_unit,
+    'applies', f.price < p_unit and (v_remaining is null or p_qty <= v_remaining)
+      and (f.per_order_max is null or p_qty <= f.per_order_max));
+end $$;
+
+-- Ce que le catalogue montre pour un produit : {} ou {flash: {...}} (jamais si le client a déjà un prix égal ou plus bas).
+create or replace function amine.flash_card(p amine.products, p_customer uuid) returns jsonb
+language plpgsql stable set search_path = '' as $$
+declare
+  v_unit int := amine.unit_price(p, p_customer, 1);
+  f jsonb := amine.flash_for(p.id, v_unit, 1);
+begin
+  if f is null or not coalesce((f ->> 'applies')::boolean, false) then
+    return '{}'::jsonb;
+  end if;
+  return jsonb_build_object('flash', f || jsonb_build_object('now', now(),
+    'percent', greatest(1, round(100 - (f ->> 'price')::numeric * 100 / v_unit))::int));
+end $$;
+
+-- Réserve les unités flash d'un panier chiffré : lignes verrouillées puis recomptées (pas de dépassement
+-- même si deux commandes arrivent ensemble). FLASH_UNAVAILABLE : la vente a pris fin ou n'a plus assez d'unités.
+create or replace function amine.flash_claim(p_lines jsonb) returns void
+language plpgsql set search_path = '' as $$
+declare
+  l jsonb;
+  f amine.flash_sales;
+  v_qty int;
+begin
+  for l in select e.value from jsonb_array_elements(p_lines) e where e.value ->> 'flash_sale_id' is not null
+           order by e.value ->> 'flash_sale_id' loop
+    v_qty := (l ->> 'quantity')::int;
+    select * into f from amine.flash_sales where id = (l ->> 'flash_sale_id')::uuid for update;
+    if not found or not f.is_active or now() < f.starts_at or now() >= f.ends_at
+       or (f.max_units is not null and amine.flash_sold(f.id) + v_qty > f.max_units)
+       or (f.per_order_max is not null and v_qty > f.per_order_max) then
+      perform amine.err('FLASH_UNAVAILABLE', l ->> 'product_id');
+    end if;
+  end loop;
+end $$;
+
+create or replace function amine.flash_json(f amine.flash_sales) returns jsonb
+language plpgsql stable set search_path = '' as $$
+declare
+  pr amine.products;
+  v_sold int := amine.flash_sold(f.id);
+  v_state text;
+begin
+  select * into pr from amine.products where id = f.product_id;
+  v_state := case
+    when not f.is_active then 'stopped'
+    when now() < f.starts_at then 'upcoming'
+    when now() >= f.ends_at then 'ended'
+    when f.max_units is not null and v_sold >= f.max_units then 'soldout'
+    else 'live' end;
+  return jsonb_build_object('id', f.id, 'product_id', f.product_id,
+    'product', jsonb_build_object('name', pr.name, 'name_ar', pr.name_ar, 'name_en', pr.name_en, 'price', pr.price,
+      'unit', pr.unit, 'image_url', pr.image_url, 'ref', pr.ref),
+    'price', f.price, 'percent', case when pr.price > 0 then greatest(0, round(100 - f.price::numeric * 100 / pr.price))::int end,
+    'starts_at', f.starts_at, 'ends_at', f.ends_at, 'max_units', f.max_units, 'per_order_max', f.per_order_max,
+    'sold', v_sold, 'remaining', case when f.max_units is null then null else greatest(0, f.max_units - v_sold) end,
+    'revenue', (select coalesce(sum(i.total), 0)::int from amine.order_items i join amine.orders o on o.id = i.order_id
+                where i.flash_sale_id = f.id and o.status not in ('cancelled', 'rejected')),
+    'state', v_state, 'notified_at', f.notified_at, 'created_at', f.created_at);
+end $$;
+
+create or replace function public.merchant_flash_sales(p_store_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+begin
+  return jsonb_build_object(
+    'items', coalesce((select jsonb_agg(amine.flash_json(f) order by f.starts_at desc)
+      from (select * from amine.flash_sales where store_id = s.id order by starts_at desc limit 100) f), '[]'::jsonb),
+    'products', coalesce((select jsonb_agg(jsonb_build_object('id', p.id, 'name', p.name, 'name_ar', p.name_ar,
+        'name_en', p.name_en, 'price', p.price, 'unit', p.unit) order by p.name)
+      from amine.products p where p.store_id = s.id and p.deleted_at is null and p.is_available), '[]'::jsonb));
+end $$;
+
+-- p_data : {product_id, price, starts_at (vide = maintenant), ends_at, max_units, per_order_max}
+create or replace function public.merchant_save_flash_sale(p_store_id uuid, p_id uuid, p_data jsonb) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  f amine.flash_sales;
+  pr amine.products;
+  v_product uuid;
+  v_price int;
+  v_starts timestamptz;
+  v_ends timestamptz;
+  v_max int;
+  v_per int;
+  v_sold int := 0;
+begin
+  perform amine.hit('flash:' || auth.uid(), 60, 3600);
+  if p_data is null or jsonb_typeof(p_data) <> 'object' then
+    perform amine.err('INVALID_INPUT', 'data');
+  end if;
+  if p_id is not null then
+    select * into f from amine.flash_sales where id = p_id and store_id = s.id for update;
+    if not found then
+      perform amine.err('NOT_FOUND');
+    end if;
+    v_sold := amine.flash_sold(f.id);
+  end if;
+  v_product := coalesce(f.product_id, amine.uuid_in(p_data, 'product_id', true));
+  select * into pr from amine.products where id = v_product and store_id = s.id and deleted_at is null;
+  if not found then
+    perform amine.err('INVALID_INPUT', 'product_id');
+  end if;
+  v_price := coalesce(f.price, 0);
+  v_starts := coalesce(f.starts_at, amine.ts_in(p_data, 'starts_at'), now());
+  v_ends := amine.ts_in(p_data, 'ends_at');
+  v_max := amine.int_in(p_data, 'max_units', 1, 1000000, false);
+  v_per := amine.int_in(p_data, 'per_order_max', 1, 999, false);
+  if p_id is null or v_sold = 0 then
+    -- Le prix et le début ne changent plus dès qu'une unité a été vendue.
+    v_price := amine.int_in(p_data, 'price', 1, 100000000, true);
+    if p_id is not null then
+      v_starts := coalesce(amine.ts_in(p_data, 'starts_at'), f.starts_at);
+    end if;
+  end if;
+  if v_price >= pr.price then
+    perform amine.err('FLASH_PRICE_TOO_HIGH', pr.price::text);
+  end if;
+  if v_ends is null or v_ends <= v_starts or v_ends <= now() then
+    perform amine.err('INVALID_INPUT', 'ends_at');
+  end if;
+  if v_ends > v_starts + interval '15 days' then
+    perform amine.err('INVALID_INPUT', 'ends_at');
+  end if;
+  if p_id is null and v_starts < now() - interval '5 minutes' then
+    perform amine.err('INVALID_INPUT', 'starts_at');
+  end if;
+  if v_max is not null and v_max < v_sold then
+    perform amine.err('INVALID_INPUT', 'max_units');
+  end if;
+  if exists (select 1 from amine.flash_sales x where x.product_id = v_product and x.is_active
+             and x.id is distinct from p_id and x.ends_at > now()
+             and tstzrange(x.starts_at, x.ends_at) && tstzrange(v_starts, v_ends)) then
+    perform amine.err('FLASH_OVERLAP');
+  end if;
+  if p_id is null then
+    insert into amine.flash_sales (store_id, product_id, price, starts_at, ends_at, max_units, per_order_max, created_by)
+    values (s.id, v_product, v_price, v_starts, v_ends, v_max, v_per, auth.uid()) returning * into f;
+  else
+    update amine.flash_sales set price = v_price, starts_at = v_starts, ends_at = v_ends, max_units = v_max,
+      per_order_max = v_per, updated_at = now()
+    where id = f.id returning * into f;
+  end if;
+  perform amine.audit('flash.saved', 'flash_sale', f.id::text, jsonb_build_object('product', pr.name, 'price', v_price));
+  return amine.flash_json(f);
+end $$;
+
+create or replace function public.merchant_stop_flash_sale(p_store_id uuid, p_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  f amine.flash_sales;
+begin
+  update amine.flash_sales set is_active = false, stopped_at = now(), updated_at = now()
+  where id = p_id and store_id = s.id and is_active returning * into f;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  perform amine.audit('flash.stopped', 'flash_sale', f.id::text, '{}'::jsonb);
+  return amine.flash_json(f);
+end $$;
+
+create or replace function public.merchant_delete_flash_sale(p_store_id uuid, p_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  f amine.flash_sales;
+begin
+  select * into f from amine.flash_sales where id = p_id and store_id = s.id for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if exists (select 1 from amine.order_items where flash_sale_id = f.id) then
+    perform amine.err('FLASH_HAS_SALES');
+  end if;
+  delete from amine.flash_sales where id = f.id;
+  perform amine.audit('flash.deleted', 'flash_sale', f.id::text, '{}'::jsonb);
+  return jsonb_build_object('ok', true);
+end $$;
+
+-- Prévient les restaurants qui ont déjà commandé ici (6 derniers mois) et ont accepté les messages : une seule fois.
+create or replace function public.merchant_notify_flash_sale(p_store_id uuid, p_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  f amine.flash_sales;
+  pr amine.products;
+  v_count int := 0;
+  c record;
+begin
+  perform amine.hit('flash_notify:' || auth.uid(), 10, 3600);
+  select * into f from amine.flash_sales where id = p_id and store_id = s.id for update;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if not f.is_active or f.ends_at <= now() then
+    perform amine.err('FLASH_UNAVAILABLE');
+  end if;
+  if f.notified_at is not null then
+    perform amine.err('FLASH_ALREADY_NOTIFIED');
+  end if;
+  select * into pr from amine.products where id = f.product_id;
+  for c in
+    select distinct o.customer_id from amine.orders o
+    join amine.profiles cu on cu.id = o.customer_id
+    where o.store_id = s.id and o.kind = 'store' and o.status = 'delivered' and o.placed_at > now() - interval '180 days'
+      and cu.status = 'active' and cu.marketing_opt_in
+    limit 500
+  loop
+    perform amine.notify(c.customer_id, 'flash_sale', jsonb_build_object('product', pr.name, 'price', f.price,
+      'percent', greatest(1, round(100 - f.price::numeric * 100 / pr.price))::int, 'ends_at', f.ends_at), '#/catalog');
+    v_count := v_count + 1;
+  end loop;
+  update amine.flash_sales set notified_at = now() where id = f.id;
+  perform amine.audit('flash.notified', 'flash_sale', f.id::text, jsonb_build_object('count', v_count));
+  return jsonb_build_object('ok', true, 'notified', v_count);
+end $$;
+
+-- ── Espace client : points, parrainage ───────────────────────────────────────────────────────
+create or replace function public.my_loyalty() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+  cfg jsonb := amine.setting('loyalty');
+  v_balance int := amine.loyalty_balance(p.id);
+  v_value int := greatest(1, (cfg ->> 'point_value')::int);
+  v_ref boolean := coalesce((cfg ->> 'enabled')::boolean, false) and coalesce((cfg ->> 'referral_enabled')::boolean, false);
+  v_code text;
+begin
+  if v_ref then
+    v_code := amine.referral_code_for(p.id);
+  end if;
+  return jsonb_build_object(
+    'enabled', coalesce((cfg ->> 'enabled')::boolean, false),
+    'balance', v_balance, 'value', v_balance * v_value, 'point_value', v_value,
+    'earn_per_dt', (cfg ->> 'earn_per_dt')::int, 'min_redeem', (cfg ->> 'min_redeem')::int,
+    'max_redeem_bps', (cfg ->> 'max_redeem_bps')::int,
+    'marketing_opt_in', p.marketing_opt_in,
+    'referral', jsonb_build_object(
+      'enabled', v_ref, 'code', v_code, 'points', (cfg ->> 'referral_points')::int,
+      'min_subtotal', (cfg ->> 'referral_min_subtotal')::int, 'max', (cfg ->> 'referral_max')::int,
+      'used', (select count(*) from amine.referrals r where r.referrer_id = p.id and r.status <> 'void'),
+      'list', coalesce((select jsonb_agg(jsonb_build_object('name', coalesce(x.business_name, '—'), 'status', r.status,
+          'created_at', r.created_at, 'rewarded_at', r.rewarded_at, 'points', r.points) order by r.created_at desc)
+        from amine.referrals r join amine.profiles x on x.id = r.referee_id where r.referrer_id = p.id), '[]'::jsonb),
+      'mine', (select jsonb_build_object('name', coalesce(x.business_name, '—'), 'status', r.status)
+        from amine.referrals r join amine.profiles x on x.id = r.referrer_id where r.referee_id = p.id),
+      'can_apply', not exists (select 1 from amine.referrals r where r.referee_id = p.id)
+        and not exists (select 1 from amine.orders o where o.customer_id = p.id and o.kind = 'store'
+                        and o.status not in ('cancelled', 'rejected'))),
+    'welcome', case when exists (select 1 from amine.orders o where o.customer_id = p.id and o.status not in ('cancelled', 'rejected'))
+      then '[]'::jsonb else coalesce((select jsonb_agg(jsonb_build_object('code', pr.code, 'description', pr.description,
+          'kind', pr.kind, 'value', pr.value, 'max_discount', pr.max_discount, 'min_subtotal', pr.min_subtotal,
+          'ends_at', pr.ends_at) order by pr.created_at)
+        from amine.promotions pr where pr.auto_apply and pr.is_active and pr.archived_at is null
+          and (pr.starts_at is null or now() >= pr.starts_at) and (pr.ends_at is null or now() < pr.ends_at)), '[]'::jsonb) end,
+    'ledger', coalesce((select jsonb_agg(jsonb_build_object('id', l.id, 'points', l.delta, 'kind', l.kind, 'ref', l.ref,
+        'note', l.note, 'at', l.created_at) order by l.id desc)
+      from (select * from amine.loyalty_ledger where customer_id = p.id order by id desc limit 60) l), '[]'::jsonb));
+end $$;
+
+create or replace function public.apply_referral_code(p_code text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+begin
+  perform amine.hit('referral:' || p.id, 10, 3600);
+  perform amine.link_referral(p.id, p_code);
+  return public.my_loyalty();
+end $$;
+
+create or replace function public.set_my_marketing(p_opt_in boolean) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+begin
+  if p_opt_in is null then
+    perform amine.err('INVALID_INPUT', 'opt_in');
+  end if;
+  update amine.profiles set marketing_opt_in = p_opt_in, updated_at = now() where id = p.id;
+  return jsonb_build_object('ok', true, 'marketing_opt_in', p_opt_in);
+end $$;
+
+-- ── Administration : tableau de bord fidélité, parrainages, points, clients inactifs ──────────
+create or replace function public.admin_loyalty() returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_value int := greatest(1, (amine.setting('loyalty') ->> 'point_value')::int);
+  v_out bigint;
+begin
+  select coalesce(sum(b.bal), 0) into v_out from (
+    select sum(delta) as bal from amine.loyalty_ledger group by customer_id having sum(delta) > 0) b;
+  return jsonb_build_object(
+    'settings', amine.setting('loyalty'),
+    'stats', jsonb_build_object(
+      'outstanding_points', v_out, 'outstanding_value', v_out * v_value,
+      'customers', (select count(*) from (select 1 from amine.loyalty_ledger group by customer_id having sum(delta) > 0) x),
+      'earned_30d', (select coalesce(sum(delta), 0) from amine.loyalty_ledger where kind = 'earn' and created_at > now() - interval '30 days'),
+      'redeemed_value_30d', (select coalesce(sum(o.loyalty_discount), 0) from amine.orders o
+        where o.loyalty_points > 0 and o.status not in ('cancelled', 'rejected') and o.placed_at > now() - interval '30 days'),
+      'referrals', jsonb_build_object(
+        'pending', (select count(*) from amine.referrals where status = 'pending'),
+        'rewarded', (select count(*) from amine.referrals where status = 'rewarded'),
+        'void', (select count(*) from amine.referrals where status = 'void')),
+      'flash_live', (select count(*) from amine.flash_sales where is_active and now() >= starts_at and now() < ends_at)),
+    'referrals', coalesce((select jsonb_agg(jsonb_build_object('id', r.id, 'status', r.status, 'void_reason', r.void_reason,
+        'points', r.points, 'created_at', r.created_at, 'rewarded_at', r.rewarded_at,
+        'referrer', jsonb_build_object('id', er.id, 'name', coalesce(er.business_name, er.full_name)),
+        'referee', jsonb_build_object('id', ee.id, 'name', coalesce(ee.business_name, ee.full_name))) order by r.created_at desc)
+      from (select * from amine.referrals order by created_at desc limit 60) r
+      join amine.profiles er on er.id = r.referrer_id join amine.profiles ee on ee.id = r.referee_id), '[]'::jsonb),
+    'welcome', coalesce((select jsonb_agg(jsonb_build_object('id', pr.id, 'code', pr.code, 'description', pr.description,
+        'kind', pr.kind, 'value', pr.value, 'is_active', pr.is_active) order by pr.created_at)
+      from amine.promotions pr where pr.auto_apply and pr.archived_at is null), '[]'::jsonb));
+end $$;
+
+create or replace function public.admin_void_referral(p_id uuid, p_reason text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_reason text := amine.txt(p_reason, 'reason', 60, true, 3);
+begin
+  update amine.referrals set status = 'void', void_reason = v_reason where id = p_id and status = 'pending';
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  perform amine.audit('referral.void', 'referral', p_id::text, jsonb_build_object('reason', v_reason));
+  return jsonb_build_object('ok', true);
+end $$;
+
+create or replace function public.admin_adjust_points(p_customer uuid, p_points int, p_note text) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_note text := amine.txt(p_note, 'note', 120, true, 3);
+  v_balance int;
+begin
+  perform amine.hit('admin_points:' || a.id, 100, 3600);
+  if p_points is null or p_points = 0 or abs(p_points) > 100000 then
+    perform amine.err('INVALID_INPUT', 'points');
+  end if;
+  if not exists (select 1 from amine.profiles where id = p_customer) then
+    perform amine.err('NOT_FOUND');
+  end if;
+  v_balance := amine.loyalty_balance(p_customer);
+  if v_balance + p_points < 0 then
+    perform amine.err('INSUFFICIENT_POINTS', greatest(0, v_balance)::text);
+  end if;
+  perform amine.loyalty_add(p_customer, p_points, 'adjust', null, null, v_note, a.id);
+  perform amine.notify(p_customer, 'points_adjusted', jsonb_build_object('points', p_points, 'note', v_note,
+    'balance', v_balance + p_points), '#/account/rewards');
+  perform amine.audit('loyalty.adjust', 'profile', p_customer::text, jsonb_build_object('points', p_points, 'note', v_note));
+  return jsonb_build_object('ok', true, 'balance', v_balance + p_points);
+end $$;
+
+-- Clients qui ont déjà commandé et n'ont pas commandé depuis au moins p_days jours (réglage par défaut : 15).
+create or replace function amine.inactive_clients(p_days int, p_limit int default 200) returns table (
+  id uuid, business_name text, full_name text, phone text, marketing_opt_in boolean, reminded_at timestamptz,
+  last_order_at timestamptz, orders bigint, spent bigint, points int
+) language sql stable set search_path = '' as $$
+  select p.id, p.business_name, p.full_name, p.phone, p.marketing_opt_in, p.reminded_at, x.last_order_at, x.orders, x.spent,
+    amine.loyalty_balance(p.id)
+  from amine.profiles p
+  join lateral (
+    select max(o.placed_at) as last_order_at, count(*) filter (where o.status = 'delivered') as orders,
+      coalesce(sum(o.total) filter (where o.status = 'delivered'), 0)::bigint as spent,
+      bool_or(o.status in ('placed', 'accepted', 'preparing', 'ready', 'picked_up')) as has_active
+    from amine.orders o where o.customer_id = p.id and o.kind = 'store' and o.status not in ('cancelled', 'rejected')) x on true
+  where p.status = 'active' and not p.is_admin and x.orders > 0 and not coalesce(x.has_active, false)
+    and x.last_order_at < now() - make_interval(days => greatest(1, p_days))
+  order by x.last_order_at
+  limit greatest(1, p_limit)
+$$;
+
+create or replace function public.admin_inactive_clients(p_days int default null) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_days int := coalesce(p_days, (amine.setting('loyalty') ->> 'remind_days')::int);
+  v_cool int := greatest(1, (amine.setting('loyalty') ->> 'remind_days')::int);
+begin
+  if v_days < 1 or v_days > 365 then
+    perform amine.err('INVALID_INPUT', 'days');
+  end if;
+  return jsonb_build_object('days', v_days, 'items', coalesce((
+    select jsonb_agg(jsonb_build_object('id', c.id, 'business_name', c.business_name, 'full_name', c.full_name,
+      'phone', c.phone, 'marketing_opt_in', c.marketing_opt_in, 'reminded_at', c.reminded_at,
+      'last_order_at', c.last_order_at, 'inactive_days', floor(extract(epoch from now() - c.last_order_at) / 86400)::int,
+      'orders', c.orders, 'spent', c.spent, 'points', c.points,
+      'can_remind', c.marketing_opt_in and (c.reminded_at is null or c.reminded_at < now() - make_interval(days => 3)))
+      order by c.last_order_at)
+    from amine.inactive_clients(v_days) c), '[]'::jsonb));
+end $$;
+
+create or replace function amine.send_inactive_reminder(c amine.profiles, p_days int) returns void
+language plpgsql set search_path = '' as $$
+begin
+  update amine.profiles set reminded_at = now() where id = c.id;
+  perform amine.notify(c.id, 'inactive_reminder', jsonb_build_object('days', p_days,
+    'points', greatest(0, amine.loyalty_balance(c.id))), '#/catalog');
+end $$;
+
+create or replace function public.admin_remind_client(p_customer uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  c amine.profiles;
+  v_last timestamptz;
+begin
+  perform amine.hit('admin_remind:' || a.id, 60, 3600);
+  select * into c from amine.profiles where id = p_customer for update;
+  if not found or c.status <> 'active' or c.is_admin then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if not c.marketing_opt_in then
+    perform amine.err('NOT_OPTED_IN');
+  end if;
+  if c.reminded_at is not null and c.reminded_at > now() - interval '3 days' then
+    perform amine.err('RECENTLY_REMINDED');
+  end if;
+  select max(o.placed_at) into v_last from amine.orders o
+  where o.customer_id = c.id and o.kind = 'store' and o.status not in ('cancelled', 'rejected');
+  perform amine.send_inactive_reminder(c, greatest(1, floor(extract(epoch from now() - coalesce(v_last, c.created_at)) / 86400)::int));
+  perform amine.audit('client.reminded', 'profile', c.id::text, '{}'::jsonb);
+  return jsonb_build_object('ok', true);
+end $$;
+
+-- Tâche de fond (au plus deux fois par jour) : rappel automatique, une seule fois par période d'inactivité.
+create or replace function amine.remind_inactive_clients() returns void
+language plpgsql set search_path = '' as $$
+declare
+  cfg jsonb := amine.setting('loyalty');
+  v_last timestamptz;
+  c record;
+begin
+  if not coalesce((cfg ->> 'remind_enabled')::boolean, false) then
+    return;
+  end if;
+  select (value ->> 'last_run')::timestamptz into v_last from amine.settings where key = 'loyalty_state';
+  if v_last is not null and v_last > now() - interval '12 hours' then
+    return;
+  end if;
+  insert into amine.settings (key, value) values ('loyalty_state', jsonb_build_object('last_run', now()))
+  on conflict (key) do update set value = excluded.value, updated_at = now();
+  for c in
+    select i.id, floor(extract(epoch from now() - i.last_order_at) / 86400)::int as days
+    from amine.inactive_clients(greatest(7, (cfg ->> 'remind_days')::int), 50) i
+    where i.marketing_opt_in and (i.reminded_at is null or i.reminded_at < i.last_order_at)
+  loop
+    perform amine.send_inactive_reminder((select p from amine.profiles p where p.id = c.id), c.days);
+  end loop;
+end $$;
+
+-- ── Droits ────────────────────────────────────────────────────────────────────────────────────
+revoke all on all tables in schema amine from public, anon, authenticated;
+revoke all on all sequences in schema amine from public, anon, authenticated;
+revoke all on all functions in schema amine from public, anon, authenticated;
+
+revoke all on function public.merchant_flash_sales(uuid) from public, anon, authenticated;
+revoke all on function public.merchant_save_flash_sale(uuid, uuid, jsonb) from public, anon, authenticated;
+revoke all on function public.merchant_stop_flash_sale(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.merchant_delete_flash_sale(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.merchant_notify_flash_sale(uuid, uuid) from public, anon, authenticated;
+revoke all on function public.my_loyalty() from public, anon, authenticated;
+revoke all on function public.apply_referral_code(text) from public, anon, authenticated;
+revoke all on function public.set_my_marketing(boolean) from public, anon, authenticated;
+revoke all on function public.admin_loyalty() from public, anon, authenticated;
+revoke all on function public.admin_void_referral(uuid, text) from public, anon, authenticated;
+revoke all on function public.admin_adjust_points(uuid, int, text) from public, anon, authenticated;
+revoke all on function public.admin_inactive_clients(int) from public, anon, authenticated;
+revoke all on function public.admin_remind_client(uuid) from public, anon, authenticated;
+grant execute on function public.merchant_flash_sales(uuid) to authenticated;
+grant execute on function public.merchant_save_flash_sale(uuid, uuid, jsonb) to authenticated;
+grant execute on function public.merchant_stop_flash_sale(uuid, uuid) to authenticated;
+grant execute on function public.merchant_delete_flash_sale(uuid, uuid) to authenticated;
+grant execute on function public.merchant_notify_flash_sale(uuid, uuid) to authenticated;
+grant execute on function public.my_loyalty() to authenticated;
+grant execute on function public.apply_referral_code(text) to authenticated;
+grant execute on function public.set_my_marketing(boolean) to authenticated;
+grant execute on function public.admin_loyalty() to authenticated;
+grant execute on function public.admin_void_referral(uuid, text) to authenticated;
+grant execute on function public.admin_adjust_points(uuid, int, text) to authenticated;
+grant execute on function public.admin_inactive_clients(int) to authenticated;
+grant execute on function public.admin_remind_client(uuid) to authenticated;
+
+notify pgrst, 'reload schema';
