@@ -10,9 +10,9 @@ Fichiers de l'application installable (écran d'accueil, ouverture hors connexio
 `manifest.webmanifest`, `sw.js` (service worker : ne met en cache que cette page et ses icônes,
 jamais les données Supabase) et les icônes `*.png`.
 
-Connexion avec Google et Facebook : les boutons n'apparaissent que si les fournisseurs sont activés dans
-Supabase (Authentication › Sign In / Providers) ; aucun changement de base. Sans activation, l'écran de
-connexion reste celui par e-mail.
+Connexion avec Google et Facebook : les deux boutons sont toujours visibles ; ils sont grisés « Bientôt disponible »
+tant que les fournisseurs ne sont pas activés dans Supabase (Authentication › Sign In / Providers) ; aucun changement
+de base. La connexion par e-mail reste disponible.
 
 Version 8 (schéma 5, inchangé depuis) : la base Supabase doit avoir reçu le script SQL de cette version (`amine.sql`,
 à coller dans Supabase › SQL Editor ; il peut être rejoué sans risque) **avant** de publier cette page,
