@@ -10,7 +10,11 @@ Fichiers de l'application installable (écran d'accueil, ouverture hors connexio
 `manifest.webmanifest`, `sw.js` (service worker : ne met en cache que cette page et ses icônes,
 jamais les données Supabase) et les icônes `*.png`.
 
-Version 8 (schéma 5) : la base Supabase doit avoir reçu le script SQL de cette version (`amine.sql`,
+Connexion avec Google et Facebook : les boutons n'apparaissent que si les fournisseurs sont activés dans
+Supabase (Authentication › Sign In / Providers) ; aucun changement de base. Sans activation, l'écran de
+connexion reste celui par e-mail.
+
+Version 8 (schéma 5, inchangé depuis) : la base Supabase doit avoir reçu le script SQL de cette version (`amine.sql`,
 à coller dans Supabase › SQL Editor ; il peut être rejoué sans risque) **avant** de publier cette page,
 sinon l'application affiche « mise à jour de la base nécessaire ».
 
