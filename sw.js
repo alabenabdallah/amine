@@ -9,7 +9,7 @@
  *   quand l'administration l'a activée ; texte mis en forme ici dans la langue de la personne
  *   (self.aminePushText, ajouté à la publication).
  */
-const CACHE = 'amine-3.0.0-91a3c3f6a5d8'
+const CACHE = 'amine-3.0.0-a75b01111703'
 const SHELL = ['./', './manifest.webmanifest', './icon-192.png', './icon-512.png', './badge-96.png']
 
 self.addEventListener('install', (event) => {
