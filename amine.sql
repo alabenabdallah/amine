@@ -1,6 +1,6 @@
 -- =============================================================================================
 --  AMINE · أمين — base de données et logique serveur (Supabase / PostgreSQL 15+)
---  Version du schéma : 4
+--  Version du schéma : 5
 --
 --  À exécuter EN ENTIER dans Supabase › SQL Editor › New query › Run.
 --  Le script peut être ré-exécuté pour une mise à jour : il ne supprime aucune donnée.
