@@ -1706,10 +1706,12 @@ begin
     'promos', coalesce((
       select jsonb_agg(jsonb_build_object('code', pr.code, 'description', pr.description, 'kind', pr.kind,
           'value', pr.value, 'max_discount', pr.max_discount, 'min_subtotal', pr.min_subtotal, 'ends_at', pr.ends_at,
-          'first_order_only', pr.first_order_only) order by pr.created_at desc)
+          'first_order_only', pr.first_order_only, 'always_on', pr.always_on) order by pr.created_at desc)
       from amine.promotions pr
       where pr.is_public and pr.is_active and pr.archived_at is null and (pr.starts_at is null or pr.starts_at <= now())
-        and (pr.ends_at is null or pr.ends_at > now())), '[]'::jsonb)
+        and (pr.ends_at is null or pr.ends_at > now())), '[]'::jsonb),
+    -- La livraison est-elle offerte à tous, en ce moment ? (les publicités ne le disent que si c'est vrai.)
+    'free_delivery', amine.standing_free_delivery()
   );
 end $$;
 
@@ -2014,7 +2016,7 @@ begin
   if p_customer is null then
     return jsonb_build_object('code', v_code, 'ok', false, 'error', 'UNAUTHENTICATED');
   end if;
-  if pr.max_uses is not null then
+  if pr.max_uses is not null and not pr.always_on then
     select count(*) into v_count from amine.orders where promo_code = pr.code and status not in ('cancelled', 'rejected');
     if v_count >= pr.max_uses then
       return jsonb_build_object('code', v_code, 'ok', false, 'error', 'PROMO_EXHAUSTED');
@@ -2022,7 +2024,7 @@ begin
   end if;
   select count(*) into v_count from amine.orders
   where promo_code = pr.code and customer_id = p_customer and status not in ('cancelled', 'rejected');
-  if v_count >= pr.max_uses_per_customer then
+  if v_count >= pr.max_uses_per_customer and not pr.always_on then
     return jsonb_build_object('code', v_code, 'ok', false, 'error', 'PROMO_ALREADY_USED');
   end if;
   if pr.first_order_only and exists (
@@ -2172,7 +2174,8 @@ begin
   select * into c from amine.couriers where user_id = p.id;
   return jsonb_build_object(
     'id', p.id, 'email', p.email, 'full_name', p.full_name, 'phone', p.phone, 'phone_verified', p.phone_verified,
-    'locale', p.locale, 'is_admin', p.is_admin, 'marketing_opt_in', p.marketing_opt_in, 'created_at', p.created_at,
+    'locale', p.locale, 'is_admin', p.is_admin, 'marketing_opt_in', p.marketing_opt_in,
+    'whatsapp_opt_in', p.whatsapp_opt_in, 'created_at', p.created_at,
     'business_name', p.business_name, 'business_type', p.business_type, 'tax_id', p.tax_id,
     'payment_terms', p.payment_terms, 'payment_days', p.payment_days, 'credit_limit', p.credit_limit,
     'discount_bps', p.discount_bps,
@@ -4351,8 +4354,10 @@ begin
       'late_orders', (select count(*) from amine.orders o where o.status in ('placed', 'accepted', 'preparing', 'ready', 'picked_up')
         and ((coalesce(o.delivery_slot, 'asap') = 'asap' and o.placed_at < now() - interval '90 minutes')
           or (coalesce(o.delivery_slot, 'asap') <> 'asap' and now() > amine.slot_end(o.deliver_on, o.delivery_slot)))),
+      -- Produits sous leur seuil minimal (25 % du stock plein par défaut, voir 15_stock_levels.sql), ruptures comprises.
       'low_stock', (select count(*) from amine.products pr join amine.stores s on s.id = pr.store_id
-        where pr.deleted_at is null and pr.stock is not null and pr.stock <= 5 and s.status = 'active'),
+        where pr.deleted_at is null and pr.stock is not null and (pr.stock = 0 or pr.stock < amine.stock_floor(pr)) and s.status = 'active'),
+      'whatsapp_pending', (select count(*) from amine.whatsapp_outbox where status = 'pending'),
       'couriers_online', (select count(*) from amine.couriers where status = 'approved' and is_online
         and last_seen_at > now() - interval '20 minutes'),
       'couriers_pending', (select count(*) from amine.couriers where status = 'pending'),
@@ -5286,7 +5291,8 @@ begin
 end $$;
 
 -- Clés : code, description, kind (percent | amount | free_delivery), value, max_discount, min_subtotal,
--- zone_id, store_id, starts_at, ends_at, max_uses, max_uses_per_customer, first_order_only, is_public, is_active.
+-- zone_id, store_id, starts_at, ends_at, max_uses, max_uses_per_customer, first_order_only, is_public, is_active,
+-- auto_apply (bienvenue), always_on (offre permanente, sans limite d'utilisation).
 create or replace function public.admin_save_promotion(p_id uuid, p_data jsonb) returns jsonb
 language plpgsql security definer set search_path = '' as $$
 declare
@@ -5323,7 +5329,7 @@ begin
   if v_store is not null and not exists (select 1 from amine.stores where id = v_store) then
     perform amine.err('INVALID_INPUT', 'store_id');
   end if;
-  foreach b in array array['first_order_only', 'is_public', 'is_active', 'auto_apply'] loop
+  foreach b in array array['first_order_only', 'is_public', 'is_active', 'auto_apply', 'always_on'] loop
     if p_data ? b and jsonb_typeof(p_data -> b) <> 'boolean' then
       perform amine.err('INVALID_INPUT', b);
     end if;
@@ -5341,14 +5347,18 @@ begin
   begin
     if p_id is null then
       insert into amine.promotions (code, description, kind, value, max_discount, min_subtotal, zone_id, store_id,
-        starts_at, ends_at, max_uses, max_uses_per_customer, first_order_only, is_public, is_active, auto_apply, created_by)
+        starts_at, ends_at, max_uses, max_uses_per_customer, first_order_only, is_public, is_active, auto_apply, always_on,
+        created_by)
       values (v_code, amine.txt(p_data ->> 'description', 'description', 120), v_kind, v_value,
         amine.int_in(p_data, 'max_discount', 1, 100000000, false), coalesce(amine.int_in(p_data, 'min_subtotal', 0, 100000000, false), 0),
         v_zone, v_store, v_starts, v_ends, amine.int_in(p_data, 'max_uses', 1, 1000000, false),
         coalesce(amine.int_in(p_data, 'max_uses_per_customer', 1, 100, false), 1),
-        coalesce((p_data ->> 'first_order_only')::boolean, false) or coalesce((p_data ->> 'auto_apply')::boolean, false),
-        coalesce((p_data ->> 'is_public')::boolean, false),
-        coalesce((p_data ->> 'is_active')::boolean, true), coalesce((p_data ->> 'auto_apply')::boolean, false), a.id)
+        (coalesce((p_data ->> 'first_order_only')::boolean, false) or coalesce((p_data ->> 'auto_apply')::boolean, false))
+          and not coalesce((p_data ->> 'always_on')::boolean, false),
+        coalesce((p_data ->> 'is_public')::boolean, false) or coalesce((p_data ->> 'always_on')::boolean, false),
+        coalesce((p_data ->> 'is_active')::boolean, true),
+        coalesce((p_data ->> 'auto_apply')::boolean, false) and not coalesce((p_data ->> 'always_on')::boolean, false),
+        coalesce((p_data ->> 'always_on')::boolean, false), a.id)
       returning * into pr;
     else
       update amine.promotions set code = v_code, description = amine.txt(p_data ->> 'description', 'description', 120),
@@ -5356,10 +5366,13 @@ begin
         min_subtotal = coalesce(amine.int_in(p_data, 'min_subtotal', 0, 100000000, false), 0), zone_id = v_zone,
         store_id = v_store, starts_at = v_starts, ends_at = v_ends, max_uses = amine.int_in(p_data, 'max_uses', 1, 1000000, false),
         max_uses_per_customer = coalesce(amine.int_in(p_data, 'max_uses_per_customer', 1, 100, false), 1),
-        -- Une offre automatique est toujours réservée à la première commande (offre de bienvenue).
-        first_order_only = coalesce((p_data ->> 'first_order_only')::boolean, false) or coalesce((p_data ->> 'auto_apply')::boolean, false),
-        auto_apply = coalesce((p_data ->> 'auto_apply')::boolean, false),
-        is_public = coalesce((p_data ->> 'is_public')::boolean, false),
+        -- Une offre automatique est toujours réservée à la première commande (offre de bienvenue) ; une offre
+        -- permanente s'adresse à toutes les commandes et est toujours annoncée.
+        first_order_only = (coalesce((p_data ->> 'first_order_only')::boolean, false) or coalesce((p_data ->> 'auto_apply')::boolean, false))
+          and not coalesce((p_data ->> 'always_on')::boolean, false),
+        auto_apply = coalesce((p_data ->> 'auto_apply')::boolean, false) and not coalesce((p_data ->> 'always_on')::boolean, false),
+        always_on = coalesce((p_data ->> 'always_on')::boolean, false),
+        is_public = coalesce((p_data ->> 'is_public')::boolean, false) or coalesce((p_data ->> 'always_on')::boolean, false),
         is_active = coalesce((p_data ->> 'is_active')::boolean, true),
         archived_at = case when coalesce((p_data ->> 'is_active')::boolean, true) then null else archived_at end
       where id = p_id returning * into pr;
@@ -9741,6 +9754,11 @@ notify pgrst, 'reload schema';
 
 -- ── Tables et colonnes ───────────────────────────────────────────────────────────────────────
 alter table amine.promotions add column if not exists auto_apply boolean not null default false;
+-- Offre permanente (ex. livraison offerte pour tous) : appliquée d'elle-même à chaque commande, sans code à saisir,
+-- sans limite d'utilisation par client. Ne se combine pas avec l'offre de bienvenue : la plus avantageuse s'applique.
+alter table amine.promotions add column if not exists always_on boolean not null default false;
+-- Date à laquelle les clients ont été prévenus de cette promotion (une seule fois).
+alter table amine.promotions add column if not exists announced_at timestamptz;
 
 alter table amine.orders add column if not exists loyalty_points int not null default 0;
 alter table amine.orders add column if not exists loyalty_discount int not null default 0;
@@ -10047,7 +10065,21 @@ create trigger amine_orders_loyalty
   after update of status on amine.orders
   for each row execute function amine.on_order_loyalty();
 
--- ── Offre de bienvenue (code promo appliqué automatiquement à la première commande) ───────────
+-- La livraison est-elle offerte à tous les clients, partout, en ce moment ? Vrai seulement s'il existe une offre
+-- permanente « livraison offerte », active, sans montant minimum ni zone ni dépôt particulier. Les publicités
+-- (accueil, robot, notifications) ne parlent de livraison offerte que dans ce cas.
+create or replace function amine.standing_free_delivery() returns boolean
+language sql stable set search_path = '' as $$
+  select exists (
+    select 1 from amine.promotions pr
+    where pr.always_on and pr.kind = 'free_delivery' and pr.is_active and pr.archived_at is null
+      and pr.min_subtotal = 0 and pr.zone_id is null and pr.store_id is null
+      and (pr.starts_at is null or pr.starts_at <= now()) and (pr.ends_at is null or pr.ends_at > now()))
+$$;
+
+-- ── Offres appliquées sans code : bienvenue (première commande) et offres permanentes ───────────
+-- Le code promo évalue lui-même ses conditions (une offre de bienvenue refuse un client qui a déjà commandé) :
+-- on essaie chaque offre automatique et on garde la plus avantageuse.
 create or replace function amine.auto_promo(
   p_customer uuid, p_store amine.stores, p_subtotal int, p_fee int, p_service int, p_lock boolean
 ) returns jsonb
@@ -10060,11 +10092,8 @@ begin
   if p_customer is null then
     return null;
   end if;
-  if exists (select 1 from amine.orders where customer_id = p_customer and status not in ('cancelled', 'rejected')) then
-    return null;
-  end if;
   for r in select pr.code from amine.promotions pr
-           where pr.auto_apply and pr.is_active and pr.archived_at is null order by pr.created_at limit 5 loop
+           where (pr.auto_apply or pr.always_on) and pr.is_active and pr.archived_at is null order by pr.created_at limit 8 loop
     v_try := amine.promo_eval(r.code, p_customer, p_store, p_subtotal, p_fee, p_service, p_lock) || jsonb_build_object('auto', true);
     if coalesce((v_try ->> 'ok')::boolean, false) then
       if v_best is null or not coalesce((v_best ->> 'ok')::boolean, false)
@@ -10323,8 +10352,10 @@ begin
       and cu.status = 'active' and cu.marketing_opt_in
     limit 500
   loop
-    perform amine.notify(c.customer_id, 'flash_sale', jsonb_build_object('product', pr.name, 'price', f.price,
-      'percent', greatest(1, round(100 - f.price::numeric * 100 / pr.price))::int, 'ends_at', f.ends_at), '#/catalog');
+    perform amine.notify(c.customer_id, 'flash_sale', jsonb_build_object('product', pr.name, 'product_ar', pr.name_ar,
+      'product_en', pr.name_en, 'brand', pr.brand, 'price', f.price, 'regular', pr.price,
+      'percent', greatest(1, round(100 - f.price::numeric * 100 / pr.price))::int, 'ends_at', f.ends_at,
+      'free_delivery', amine.standing_free_delivery()), '#/catalog');
     v_count := v_count + 1;
   end loop;
   update amine.flash_sales set notified_at = now() where id = f.id;
@@ -10514,7 +10545,7 @@ language plpgsql set search_path = '' as $$
 begin
   update amine.profiles set reminded_at = now() where id = c.id;
   perform amine.notify(c.id, 'inactive_reminder', jsonb_build_object('days', p_days,
-    'points', greatest(0, amine.loyalty_balance(c.id))), '#/catalog');
+    'points', greatest(0, amine.loyalty_balance(c.id)), 'free_delivery', amine.standing_free_delivery()), '#/catalog');
 end $$;
 
 create or replace function public.admin_remind_client(p_customer uuid) returns jsonb
@@ -10599,5 +10630,453 @@ grant execute on function public.admin_void_referral(uuid, text) to authenticate
 grant execute on function public.admin_adjust_points(uuid, int, text) to authenticated;
 grant execute on function public.admin_inactive_clients(int) to authenticated;
 grant execute on function public.admin_remind_client(uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- =============================================================================================
+--  Niveaux de stock (version 9) : seuil minimal, alerte sous 25 %, vue en direct
+--
+--  • Chaque produit suivi a un « stock plein » (celui qu'on a voulu avoir en rayon) et un seuil minimal.
+--    Le stock plein est saisi à la main (stock_target) ; sans saisie, c'est le plus haut niveau atteint
+--    (stock_peak, tenu à jour par la base). Le seuil minimal est saisi à la main (stock_min) ; sans saisie,
+--    c'est 25 % du stock plein, arrondi au-dessus. Sans stock plein connu, le seuil est de 6 unités.
+--  • Quand le stock passe sous le seuil, l'équipe du dépôt reçoit UNE notification (stock_low), ou
+--    stock_out à la rupture ; pas plus d'une par produit toutes les 12 heures.
+--  • merchant_stock donne la liste des niveaux (du plus bas au plus haut) ; admin_stock_alerts résume les
+--    produits sous le seuil pour toute la plateforme.
+--
+--  Ce script complète les précédents ; il peut être rejoué sans risque.
+-- =============================================================================================
+
+alter table amine.products add column if not exists stock_target int
+  check (stock_target is null or stock_target between 1 and 1000000);
+alter table amine.products add column if not exists stock_min int
+  check (stock_min is null or stock_min between 0 and 1000000);
+alter table amine.products add column if not exists stock_peak int not null default 0
+  check (stock_peak between 0 and 1000000);
+
+-- Les produits déjà suivis prennent leur stock actuel comme plus haut niveau connu.
+update amine.products set stock_peak = stock where stock is not null and stock > stock_peak;
+
+-- ── Calculs ──────────────────────────────────────────────────────────────────────────────────
+create or replace function amine.stock_target_of(p amine.products) returns int
+language sql stable set search_path = '' as $$
+  select coalesce(p.stock_target, nullif(p.stock_peak, 0))
+$$;
+
+create or replace function amine.stock_floor(p amine.products) returns int
+language sql stable set search_path = '' as $$
+  select coalesce(p.stock_min,
+    case when amine.stock_target_of(p) is not null then greatest(1, ceil(amine.stock_target_of(p) * 0.25)::int) end,
+    6)
+$$;
+
+-- Part du stock plein encore en rayon, en pour cent (null : stock plein inconnu ou produit non suivi).
+create or replace function amine.stock_pct(p amine.products) returns int
+language sql stable set search_path = '' as $$
+  select case when p.stock is null or amine.stock_target_of(p) is null then null
+    else least(999, round(p.stock * 100.0 / amine.stock_target_of(p))::int) end
+$$;
+
+create or replace function amine.stock_level_json(p amine.products) returns jsonb
+language sql stable set search_path = '' as $$
+  select jsonb_build_object('product_id', p.id, 'name', p.name, 'name_ar', p.name_ar, 'name_en', p.name_en,
+    'unit', p.unit, 'ref', p.ref, 'brand', p.brand, 'stock', p.stock,
+    'floor', amine.stock_floor(p), 'min', p.stock_min, 'target', p.stock_target, 'full', amine.stock_target_of(p),
+    'pct', amine.stock_pct(p),
+    'state', case when p.stock = 0 then 'out' when p.stock < amine.stock_floor(p) then 'low' else 'ok' end)
+$$;
+
+-- ── Plus haut niveau atteint ─────────────────────────────────────────────────────────────────
+create or replace function amine.track_stock_peak() returns trigger
+language plpgsql set search_path = '' as $$
+begin
+  if new.stock is not null and new.stock > coalesce(new.stock_peak, 0) then
+    new.stock_peak := new.stock;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists amine_products_peak on amine.products;
+create trigger amine_products_peak
+  before insert or update of stock on amine.products
+  for each row execute function amine.track_stock_peak();
+
+-- ── Alerte : le stock passe sous le seuil ────────────────────────────────────────────────────
+create or replace function amine.stock_alert() returns trigger
+language plpgsql set search_path = '' as $$
+declare
+  v_floor int;
+  v_kind text;
+begin
+  if new.stock is null or new.deleted_at is not null or new.stock is not distinct from old.stock then
+    return new;
+  end if;
+  v_floor := amine.stock_floor(new);
+  -- Seulement quand le seuil est franchi vers le bas (ou à la rupture), pas à chaque vente.
+  if (new.stock < v_floor or new.stock = 0) and (old.stock is null or old.stock >= v_floor or (new.stock = 0 and old.stock > 0)) then
+    v_kind := case when new.stock = 0 then 'stock_out' else 'stock_low' end;
+    if not exists (
+      select 1 from amine.notifications n
+      where n.kind = v_kind and n.params ->> 'product_id' = new.id::text and n.created_at > now() - interval '12 hours') then
+      perform amine.notify_store(new.store_id, v_kind, jsonb_build_object(
+          'product_id', new.id, 'name', new.name, 'name_ar', new.name_ar, 'name_en', new.name_en, 'brand', new.brand,
+          'stock', new.stock, 'floor', v_floor, 'unit', coalesce(new.unit, ''), 'percent', coalesce(amine.stock_pct(new), 0)),
+        '#/depot/stock?store=' || new.store_id::text);
+    end if;
+  end if;
+  return new;
+end $$;
+
+drop trigger if exists amine_products_stock_alert on amine.products;
+create trigger amine_products_stock_alert
+  after update of stock on amine.products
+  for each row execute function amine.stock_alert();
+
+-- ── Vue d'ensemble du stock (remplace celle de 08_business.sql) ──────────────────────────────
+create or replace function public.merchant_stock(p_store_id uuid, p_product_id uuid default null, p_limit int default 100) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  v_today date := (now() at time zone 'Africa/Tunis')::date;
+begin
+  return jsonb_build_object(
+    'summary', (select jsonb_build_object(
+        'value', coalesce(sum(p.stock::bigint * p.cost_price) filter (where p.cost_price is not null and p.stock > 0), 0),
+        'tracked', count(*) filter (where p.stock is not null),
+        'low', count(*) filter (where p.stock > 0 and p.stock < amine.stock_floor(p)),
+        'out', count(*) filter (where p.stock = 0),
+        'without_cost', count(*) filter (where p.stock > 0 and p.cost_price is null))
+      from amine.products p where p.store_id = s.id and p.deleted_at is null),
+    'levels', coalesce((
+      select jsonb_agg(amine.stock_level_json(p) order by
+          case when p.stock = 0 then 0 when p.stock < amine.stock_floor(p) then 1 else 2 end,
+          amine.stock_pct(p) nulls last, p.name)
+      from amine.products p
+      where p.id in (select q.id from amine.products q where q.store_id = s.id and q.deleted_at is null and q.stock is not null
+          order by case when q.stock = 0 then 0 when q.stock < amine.stock_floor(q) then 1 else 2 end,
+            amine.stock_pct(q) nulls last, q.name limit 80)), '[]'::jsonb),
+    'movements', coalesce((
+      select jsonb_agg(jsonb_build_object('id', m.id, 'product_id', m.product_id, 'name', p.name, 'name_ar', p.name_ar,
+          'name_en', p.name_en, 'unit', p.unit, 'ref', p.ref, 'kind', m.kind, 'quantity', m.quantity,
+          'stock_after', m.stock_after, 'reference', m.ref, 'reason', m.reason, 'created_at', m.created_at,
+          'by', (select x.full_name from amine.profiles x where x.id = m.created_by)) order by m.id desc)
+      from (select * from amine.stock_movements where store_id = s.id and (p_product_id is null or product_id = p_product_id)
+            order by id desc limit least(greatest(coalesce(p_limit, 100), 1), 500)) m
+      join amine.products p on p.id = m.product_id), '[]'::jsonb),
+    'expiring', coalesce((
+      select jsonb_agg(jsonb_build_object('purchase_id', pu.id, 'product_id', p.id, 'name', p.name, 'name_ar', p.name_ar,
+          'name_en', p.name_en, 'unit', p.unit, 'ref', p.ref, 'expiry_on', l.expiry_on, 'quantity', l.quantity,
+          'remaining', l.remaining, 'lot', l.lot, 'received_on', pu.received_on, 'stock', p.stock,
+          'days', l.expiry_on - v_today) order by l.expiry_on, p.name)
+      from amine.purchase_lines l join amine.purchases pu on pu.id = l.purchase_id
+      join amine.products p on p.id = l.product_id
+      where pu.store_id = s.id and pu.status = 'received' and l.expiry_on is not null
+        and l.expiry_on between v_today - 7 and v_today + 7 and l.remaining > 0 and p.deleted_at is null), '[]'::jsonb));
+end $$;
+
+-- Seuil minimal et stock plein d'un produit. Une valeur vide (null) revient au calcul automatique.
+create or replace function public.merchant_set_stock_levels(p_store_id uuid, p_id uuid, p_min int, p_target int) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  pr amine.products;
+begin
+  if p_min is not null and (p_min < 0 or p_min > 1000000) then
+    perform amine.err('INVALID_INPUT', 'stock_min');
+  end if;
+  if p_target is not null and (p_target < 1 or p_target > 1000000) then
+    perform amine.err('INVALID_INPUT', 'stock_target');
+  end if;
+  if p_min is not null and p_target is not null and p_min > p_target then
+    perform amine.err('INVALID_INPUT', 'stock_min');
+  end if;
+  update amine.products set stock_min = p_min, stock_target = p_target, updated_at = now()
+  where id = p_id and store_id = s.id and deleted_at is null returning * into pr;
+  if not found then
+    perform amine.err('NOT_FOUND');
+  end if;
+  return amine.stock_level_json(pr);
+end $$;
+
+-- ── Résumé pour l'administration : produits sous le seuil, tous dépôts actifs ─────────────────
+create or replace function public.admin_stock_alerts(p_limit int default 8) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+begin
+  return jsonb_build_object(
+    'low', (select count(*) from amine.products p join amine.stores s on s.id = p.store_id
+      where p.deleted_at is null and s.status = 'active' and p.stock > 0 and p.stock < amine.stock_floor(p)),
+    'out', (select count(*) from amine.products p join amine.stores s on s.id = p.store_id
+      where p.deleted_at is null and s.status = 'active' and p.stock = 0),
+    'items', coalesce((
+      select jsonb_agg(amine.stock_level_json(p) || jsonb_build_object('store', s.name, 'store_id', s.id)
+        order by p.stock = 0 desc, amine.stock_pct(p) nulls last, p.name)
+      from amine.products p join amine.stores s on s.id = p.store_id
+      where p.id in (select q.id from amine.products q join amine.stores t on t.id = q.store_id
+          where q.deleted_at is null and t.status = 'active' and q.stock is not null and q.stock < amine.stock_floor(q)
+          order by q.stock = 0 desc, amine.stock_pct(q) nulls last, q.name
+          limit least(greatest(coalesce(p_limit, 8), 1), 50))), '[]'::jsonb));
+end $$;
+
+-- ── Droits ────────────────────────────────────────────────────────────────────────────────────
+revoke all on all functions in schema amine from public, anon, authenticated;
+revoke all on function public.merchant_stock(uuid, uuid, int) from public, anon, authenticated;
+revoke all on function public.merchant_set_stock_levels(uuid, uuid, int, int) from public, anon, authenticated;
+revoke all on function public.admin_stock_alerts(int) from public, anon, authenticated;
+grant execute on function public.merchant_stock(uuid, uuid, int) to authenticated;
+grant execute on function public.merchant_set_stock_levels(uuid, uuid, int, int) to authenticated;
+grant execute on function public.admin_stock_alerts(int) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- =============================================================================================
+--  Annonces de promotions et notifications WhatsApp (version 10)
+--
+--  • admin_announce_promotion : l'administration annonce une promotion publique à tous les clients qui ont
+--    accepté de recevoir les offres (notification « promo_new »). Une annonce par promotion et par jour.
+--  • WhatsApp : chaque personne peut demander à recevoir ses notifications sur WhatsApp (profil). Chaque
+--    notification concernée est copiée dans une file d'envoi que l'équipe AMINE vide depuis l'administration :
+--    un clic ouvre WhatsApp avec le message prêt à partir. Aucun message ne part sans cet envoi, et aucun service
+--    tiers n'est appelé. (L'envoi entièrement automatique demande un compte WhatsApp Business.)
+--
+--  Ce script complète les précédents ; il peut être rejoué sans risque.
+-- =============================================================================================
+
+alter table amine.profiles add column if not exists whatsapp_opt_in boolean not null default false;
+
+-- ── File d'envoi WhatsApp ────────────────────────────────────────────────────────────────────
+create table if not exists amine.whatsapp_outbox (
+  id              uuid primary key default gen_random_uuid(),
+  notification_id uuid not null unique references amine.notifications (id) on delete cascade,
+  user_id         uuid not null references amine.profiles (id) on delete cascade,
+  phone           text not null check (phone ~ '^\+216[2-9][0-9]{7}$'),
+  locale          text not null default 'fr' check (locale in ('fr', 'ar', 'en')),
+  kind            text not null,
+  params          jsonb not null default '{}'::jsonb,
+  link            text,
+  status          text not null default 'pending' check (status in ('pending', 'sent', 'skipped')),
+  created_at      timestamptz not null default now(),
+  handled_at      timestamptz,
+  handled_by      uuid
+);
+create index if not exists whatsapp_outbox_pending_idx on amine.whatsapp_outbox (created_at) where status = 'pending';
+alter table amine.whatsapp_outbox enable row level security;
+
+-- Notifications copiées vers WhatsApp : les suites de commande, les factures, les rappels de lot, les alertes de
+-- stock du dépôt, et les offres (qui n'existent déjà que pour les clients ayant accepté les offres).
+create or replace function amine.whatsapp_enqueue() returns trigger
+language plpgsql set search_path = '' as $$
+declare
+  p amine.profiles;
+begin
+  if not (new.kind = any (array[
+      'order_new', 'order_accepted', 'order_rejected', 'order_ready', 'order_picked_up', 'order_delivered', 'order_cancelled',
+      'invoice_issued', 'invoice_overdue', 'lot_recall', 'lot_recall_open', 'stock_low', 'stock_out',
+      'promo_new', 'flash_sale', 'inactive_reminder', 'points_earned', 'referral_rewarded'])) then
+    return new;
+  end if;
+  select * into p from amine.profiles where id = new.user_id;
+  if not found or not p.whatsapp_opt_in or p.phone is null or p.status <> 'active' then
+    return new;
+  end if;
+  insert into amine.whatsapp_outbox (notification_id, user_id, phone, locale, kind, params, link)
+  values (new.id, p.id, p.phone, p.locale, new.kind, new.params, new.link)
+  on conflict (notification_id) do nothing;
+  return new;
+end $$;
+
+drop trigger if exists amine_notifications_whatsapp on amine.notifications;
+create trigger amine_notifications_whatsapp
+  after insert on amine.notifications
+  for each row execute function amine.whatsapp_enqueue();
+
+-- ── Choix de la personne ─────────────────────────────────────────────────────────────────────
+create or replace function public.set_my_whatsapp(p_opt_in boolean) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  p amine.profiles := amine.me();
+begin
+  if p_opt_in is null then
+    perform amine.err('INVALID_INPUT', 'opt_in');
+  end if;
+  if p_opt_in and p.phone is null then
+    perform amine.err('INVALID_INPUT', 'phone');
+  end if;
+  update amine.profiles set whatsapp_opt_in = p_opt_in, updated_at = now() where id = p.id;
+  -- Désactivé : les messages en attente ne partiront pas.
+  if not p_opt_in then
+    update amine.whatsapp_outbox set status = 'skipped', handled_at = now() where user_id = p.id and status = 'pending';
+  end if;
+  return jsonb_build_object('ok', true, 'whatsapp_opt_in', p_opt_in);
+end $$;
+
+-- ── Administration : file d'envoi ────────────────────────────────────────────────────────────
+create or replace function public.admin_whatsapp_queue(p_limit int default 100) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+begin
+  return jsonb_build_object(
+    'pending', (select count(*) from amine.whatsapp_outbox where status = 'pending'),
+    'sent_today', (select count(*) from amine.whatsapp_outbox
+      where status = 'sent' and handled_at >= date_trunc('day', now() at time zone 'Africa/Tunis') at time zone 'Africa/Tunis'),
+    'items', coalesce((
+      select jsonb_agg(jsonb_build_object('id', w.id, 'user_id', w.user_id,
+          'name', coalesce(nullif(btrim(coalesce(u.business_name, '')), ''), u.full_name), 'phone', w.phone,
+          'locale', w.locale, 'kind', w.kind, 'params', w.params, 'link', w.link, 'created_at', w.created_at)
+        order by w.created_at)
+      from (select * from amine.whatsapp_outbox where status = 'pending' order by created_at
+            limit least(greatest(coalesce(p_limit, 100), 1), 300)) w
+      join amine.profiles u on u.id = w.user_id), '[]'::jsonb));
+end $$;
+
+-- Marque des messages comme envoyés (ou ignorés).
+create or replace function public.admin_whatsapp_done(p_ids uuid[], p_status text default 'sent') returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  v_count int;
+begin
+  if p_status is null or p_status not in ('sent', 'skipped') then
+    perform amine.err('INVALID_INPUT', 'status');
+  end if;
+  if p_ids is null or cardinality(p_ids) = 0 or cardinality(p_ids) > 300 then
+    perform amine.err('INVALID_INPUT', 'ids');
+  end if;
+  update amine.whatsapp_outbox set status = p_status, handled_at = now(), handled_by = a.id
+  where id = any (p_ids) and status = 'pending';
+  get diagnostics v_count = row_count;
+  return jsonb_build_object('ok', true, 'updated', v_count);
+end $$;
+
+-- ── Annonce d'une promotion ──────────────────────────────────────────────────────────────────
+create or replace function public.admin_announce_promotion(p_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  a amine.profiles := amine.require_admin();
+  pr amine.promotions;
+  v_count int := 0;
+  c record;
+begin
+  perform amine.hit('promo_announce:' || a.id, 20, 3600);
+  select * into pr from amine.promotions where id = p_id for update;
+  if not found or pr.archived_at is not null then
+    perform amine.err('NOT_FOUND');
+  end if;
+  if not pr.is_active or not pr.is_public or (pr.ends_at is not null and pr.ends_at <= now()) then
+    perform amine.err('PROMO_NOT_PUBLIC');
+  end if;
+  if pr.announced_at is not null and pr.announced_at > now() - interval '1 day' then
+    perform amine.err('PROMO_ALREADY_ANNOUNCED');
+  end if;
+  for c in
+    select cu.id from amine.profiles cu
+    where cu.status = 'active' and not cu.is_admin and cu.marketing_opt_in
+      and (not pr.first_order_only
+           or not exists (select 1 from amine.orders o where o.customer_id = cu.id and o.kind = 'store'
+                          and o.status not in ('cancelled', 'rejected')))
+    order by cu.created_at
+    limit 2000
+  loop
+    perform amine.notify(c.id, 'promo_new', jsonb_build_object('code', pr.code, 'promo', pr.kind, 'value', pr.value,
+      'min_subtotal', pr.min_subtotal, 'ends_at', pr.ends_at, 'description', coalesce(pr.description, ''),
+      'free_delivery', amine.standing_free_delivery(), 'always_on', pr.always_on), '#/catalog');
+    v_count := v_count + 1;
+  end loop;
+  update amine.promotions set announced_at = now() where id = pr.id;
+  perform amine.audit('promotion.announced', 'promotion', pr.id::text, jsonb_build_object('code', pr.code, 'count', v_count));
+  return jsonb_build_object('ok', true, 'notified', v_count);
+end $$;
+
+-- ── Droits ────────────────────────────────────────────────────────────────────────────────────
+revoke all on all functions in schema amine from public, anon, authenticated;
+revoke all on function public.set_my_whatsapp(boolean) from public, anon, authenticated;
+revoke all on function public.admin_whatsapp_queue(int) from public, anon, authenticated;
+revoke all on function public.admin_whatsapp_done(uuid[], text) from public, anon, authenticated;
+revoke all on function public.admin_announce_promotion(uuid) from public, anon, authenticated;
+grant execute on function public.set_my_whatsapp(boolean) to authenticated;
+grant execute on function public.admin_whatsapp_queue(int) to authenticated;
+grant execute on function public.admin_whatsapp_done(uuid[], text) to authenticated;
+grant execute on function public.admin_announce_promotion(uuid) to authenticated;
+
+notify pgrst, 'reload schema';
+
+-- =============================================================================================
+--  Tableau de bord du dépôt (version 10) : tout ce qu'il faut en un seul appel, rafraîchi en direct
+--
+--  • pipeline : commandes en cours à chaque étape, de la réception à la livraison (livrées : celles d'aujourd'hui) ;
+--  • sales : ventes du jour (comparées à hier), commandes du jour, panier moyen, 7 derniers jours, produits phares ;
+--  • stock : valeur, produits suivis, produits sous le seuil minimal (25 % du stock plein par défaut) et ruptures,
+--    avec les produits les plus bas.
+--
+--  Ce script complète les précédents ; il peut être rejoué sans risque.
+-- =============================================================================================
+
+create or replace function public.merchant_dashboard(p_store_id uuid) returns jsonb
+language plpgsql security definer set search_path = '' as $$
+declare
+  s amine.stores := amine.require_staff(p_store_id);
+  v_today_date date := (now() at time zone 'Africa/Tunis')::date;
+  v_today timestamptz := v_today_date::timestamp at time zone 'Africa/Tunis';
+  v_yesterday timestamptz := (v_today_date - 1)::timestamp at time zone 'Africa/Tunis';
+  v_week timestamptz := (v_today_date - 6)::timestamp at time zone 'Africa/Tunis';
+  v_month timestamptz := (v_today_date - 29)::timestamp at time zone 'Africa/Tunis';
+begin
+  perform amine.maintenance();
+  return jsonb_build_object(
+    'updated_at', now(),
+    'pipeline', (select jsonb_build_object(
+        'placed', count(*) filter (where o.status = 'placed'),
+        'accepted', count(*) filter (where o.status = 'accepted'),
+        'preparing', count(*) filter (where o.status = 'preparing'),
+        'ready', count(*) filter (where o.status = 'ready'),
+        'picked_up', count(*) filter (where o.status = 'picked_up'),
+        'delivered', count(*) filter (where o.status = 'delivered' and o.delivered_at >= v_today),
+        'waiting_courier', count(*) filter (where o.courier_id is null and o.status in ('accepted', 'preparing', 'ready')
+          and amine.job_open(o)))
+      from amine.orders o
+      where o.store_id = s.id
+        and (o.status in ('placed', 'accepted', 'preparing', 'ready', 'picked_up') or (o.status = 'delivered' and o.delivered_at >= v_today))),
+    'sales', (select jsonb_build_object(
+        'orders', count(*) filter (where o.placed_at >= v_today and o.status not in ('cancelled', 'rejected')),
+        'delivered', count(*) filter (where o.status = 'delivered' and o.delivered_at >= v_today),
+        'revenue', coalesce(sum(o.subtotal) filter (where o.status = 'delivered' and o.delivered_at >= v_today), 0),
+        'yesterday', coalesce(sum(o.subtotal) filter (where o.status = 'delivered' and o.delivered_at >= v_yesterday and o.delivered_at < v_today), 0),
+        'basket', coalesce(round(avg(o.subtotal) filter (where o.status = 'delivered' and o.delivered_at >= v_today))::int, 0))
+      from amine.orders o where o.store_id = s.id and (o.placed_at >= v_yesterday or o.delivered_at >= v_yesterday)),
+    'week', (select jsonb_agg(jsonb_build_object('day', d.day, 'orders', coalesce(x.orders, 0), 'revenue', coalesce(x.revenue, 0)) order by d.day)
+      from (select v_today_date - g as day from generate_series(0, 6) g) d
+      left join (
+        select (o.placed_at at time zone 'Africa/Tunis')::date as day,
+          count(*) filter (where o.status not in ('cancelled', 'rejected')) as orders,
+          coalesce(sum(o.subtotal) filter (where o.status = 'delivered'), 0) as revenue
+        from amine.orders o where o.store_id = s.id and o.placed_at >= v_week group by 1) x on x.day = d.day),
+    'top', coalesce((
+      select jsonb_agg(jsonb_build_object('name', t.name, 'quantity', t.quantity, 'revenue', t.revenue) order by t.quantity desc)
+      from (select i.name, sum(i.quantity) as quantity, sum(i.total) as revenue
+            from amine.order_items i join amine.orders o on o.id = i.order_id
+            where o.store_id = s.id and o.status = 'delivered' and o.placed_at >= v_month
+            group by i.name order by 2 desc limit 5) t), '[]'::jsonb),
+    'stock', (select jsonb_build_object(
+        'tracked', count(*) filter (where p.stock is not null),
+        'low', count(*) filter (where p.stock > 0 and p.stock < amine.stock_floor(p)),
+        'out', count(*) filter (where p.stock = 0),
+        'value', coalesce(sum(p.stock::bigint * p.cost_price) filter (where p.cost_price is not null and p.stock > 0), 0))
+      from amine.products p where p.store_id = s.id and p.deleted_at is null),
+    'low_items', coalesce((
+      select jsonb_agg(amine.stock_level_json(p) order by case when p.stock = 0 then 0 else 1 end, amine.stock_pct(p) nulls last, p.name)
+      from amine.products p
+      where p.id in (select q.id from amine.products q
+          where q.store_id = s.id and q.deleted_at is null and q.stock is not null and (q.stock = 0 or q.stock < amine.stock_floor(q))
+          order by case when q.stock = 0 then 0 else 1 end, amine.stock_pct(q) nulls last, q.name limit 6)), '[]'::jsonb),
+    'flash_live', (select count(*) from amine.flash_sales f
+      where f.store_id = s.id and f.is_active and f.starts_at <= now() and f.ends_at > now()));
+end $$;
+
+revoke all on all functions in schema amine from public, anon, authenticated;
+revoke all on function public.merchant_dashboard(uuid) from public, anon, authenticated;
+grant execute on function public.merchant_dashboard(uuid) to authenticated;
 
 notify pgrst, 'reload schema';
