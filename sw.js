@@ -9,8 +9,8 @@
  *   quand l'administration l'a activée ; texte mis en forme ici dans la langue de la personne
  *   (self.aminePushText, ajouté à la publication).
  */
-const CACHE = 'amine-3.0.0-342ad2e48b10'
-const SHELL = ['./', './manifest.webmanifest', './icon-192.1954d43a.png', './icon-512.30352bb1.png', './badge-96.792b0b8d.png']
+const CACHE = 'amine-3.0.0-001c59d14816'
+const SHELL = ['./', './manifest.webmanifest', './icon-192.2943a59a.png', './icon-512.6e30d097.png', './badge-96.1dbd4875.png']
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -84,8 +84,8 @@ self.addEventListener('push', (event) => {
     self.registration.showNotification(text.title, {
       body: text.body,
       tag: text.tag,
-      icon: './icon-192.1954d43a.png',
-      badge: './badge-96.792b0b8d.png',
+      icon: './icon-192.2943a59a.png',
+      badge: './badge-96.1dbd4875.png',
       data: { link: text.link },
     }),
   )
