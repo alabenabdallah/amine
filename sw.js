@@ -9,7 +9,7 @@
  *   quand l'administration l'a activée ; texte mis en forme ici dans la langue de la personne
  *   (self.aminePushText, ajouté à la publication).
  */
-const CACHE = 'amine-3.0.0-78185a2c4bc8'
+const CACHE = 'amine-3.0.0-552da6b9f786'
 const SHELL = ['./', './manifest.webmanifest', './icon-192.1954d43a.png', './icon-512.30352bb1.png', './badge-96.792b0b8d.png']
 
 self.addEventListener('install', (event) => {
@@ -36,8 +36,9 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
   if (request.mode === 'navigate') {
+    // « no-cache » : le serveur confirme à chaque ouverture que la page est la dernière publiée.
     event.respondWith(
-      fetch(request)
+      fetch(request.url, { cache: 'no-cache', credentials: 'same-origin' })
         .then((response) => {
           if (response.ok) {
             const copy = response.clone()
